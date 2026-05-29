@@ -1,0 +1,7 @@
+state/
+tmp/
+*.local.toml
+*.local.md
+.env
+.DS_Store
+*.log

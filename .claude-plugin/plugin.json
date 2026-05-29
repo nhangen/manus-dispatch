@@ -1,0 +1,10 @@
+{
+  "name": "manus-research",
+  "version": "0.1.0",
+  "description": "Dispatch long-running research tasks to the Manus AI agent platform from Claude Code via slash command. On-demand polling, optional Obsidian filing, explicit-invocation cost gating.",
+  "author": {
+    "name": "nhangen"
+  },
+  "license": "MIT",
+  "keywords": ["manus", "research", "agent", "claude-code", "obsidian"]
+}
