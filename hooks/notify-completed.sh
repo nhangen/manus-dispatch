@@ -1,17 +1,32 @@
 #!/usr/bin/env bash
-# SessionStart hook: surface any Manus tasks that completed since last session.
+# Surface any Manus tasks that completed since the last fire of this hook.
+#
+# Wired into both SessionStart (catches results when you come back) and Stop
+# (catches results that arrive mid-session). Idempotent: each surfaced task
+# is marked .notified_at so subsequent fires are silent until something new
+# completes.
 #
 # Walks the state dir, calls manus-client.sh result for each task that hasn't
-# been notified yet, and emits additionalContext so Claude opens the session
-# already knowing what came back. Marks notified_at on each surfaced task so
-# the next SessionStart doesn't re-fire.
+# been notified yet, and emits additionalContext so Claude sees what came
+# back without you having to run /manus-dispatch:status manually.
 #
 # Skips silently when:
 # - no state dir
 # - no running or unsurfaced-completed tasks
-# - manus-client.sh missing or no API key configured (no point alarming)
+# - manus-client.sh missing, jq missing, or no API key configured
 
 set -u
+
+# Read the hook event JSON from stdin (non-blocking) to detect which event
+# fired — Claude Code expects hookSpecificOutput.hookEventName to match.
+HOOK_EVENT="SessionStart"
+if [ ! -t 0 ]; then
+  hook_input=$(cat 2>/dev/null || true)
+  if [ -n "$hook_input" ] && command -v jq >/dev/null 2>&1; then
+    evt=$(printf '%s' "$hook_input" | jq -r '.hook_event_name // empty' 2>/dev/null || true)
+    [ -n "$evt" ] && HOOK_EVENT="$evt"
+  fi
+fi
 
 : "${HOME:?HOME must be set}"
 
@@ -81,9 +96,9 @@ done
   if [ "$still_running" -gt 0 ]; then
     echo "Still running: ${still_running} task(s). Run /manus-dispatch:status for details."
   fi
-} | jq -Rs '{
+} | jq -Rs --arg evt "$HOOK_EVENT" '{
   hookSpecificOutput: {
-    hookEventName: "SessionStart",
+    hookEventName: $evt,
     additionalContext: .
   }
 }'

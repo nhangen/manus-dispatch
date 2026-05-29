@@ -15,12 +15,17 @@ research; Claude orchestrates and synthesizes the result back into your session.
 The plugin also ships `scripts/manus-client.sh`, which you can call directly
 outside Claude Code: `manus-client.sh create|status|result|cancel`.
 
-## Auto-notify on next session (v0.1.1)
+## Auto-notify on completed tasks (v0.1.1)
 
-A `SessionStart` hook walks the state dir and, for every task that hasn't
-been surfaced yet, calls `manus-client.sh result` and injects a one-line
-summary into the new session as `additionalContext`. So if you dispatch a
-task, close Claude Code, and open it again later, you'll see:
+Two hooks point at the same script `hooks/notify-completed.sh`:
+
+- **`SessionStart`** — catches tasks that completed while Claude Code was
+  closed. Fires once when you open a new session.
+- **`Stop`** — catches tasks that complete mid-conversation. Fires after
+  every Claude response.
+
+Both walk `~/.config/manus-dispatch/state/`, call `manus-client.sh result`
+on any task that hasn't been surfaced yet, and emit `additionalContext`:
 
 ```
 ## Manus tasks
@@ -32,10 +37,15 @@ Completed since last session:
 Still running: N task(s). Run /manus-dispatch:status for details.
 ```
 
-Cost: zero extra Claude turns (hooks run local bash, not model invocations).
-The hook marks `notified_at` in each state file so it won't re-fire on the
-next session. Skips silently when no state dir, no API key, or no
-unsurfaced tasks. Cross-platform — no scheduler, no public endpoint.
+Cost: zero extra Claude turns (hooks run local bash, not model
+invocations). Each surfaced task is marked `notified_at` so subsequent
+fires are silent until something new completes. Stop hook bails in a
+fork+jq+ls when nothing's dispatched. Cross-platform — pure bash, no
+scheduler, no public endpoint.
+
+Caveat: per Claude Code hook semantics, `additionalContext` is advisory
+— Claude is free to ignore it. In practice the agent reads it as session
+context. Do not rely on it for hard enforcement.
 
 ## Why
 
