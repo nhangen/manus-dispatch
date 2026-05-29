@@ -4,19 +4,20 @@
 # Endpoints (base https://api.manus.ai):
 #   POST /v2/task.create        body: {"message":{"content":[{"type":"text","text":"<query>"}]}}
 #                               resp: {ok, request_id, task_id, task_title, task_url, share_url}
-#   GET  /v2/task.listMessages  ?task_id=<id>&order=desc&limit=10
-#                               status surfaces via agent_status in the latest event:
-#                                 running | stopped | waiting | error
-#   POST /v2/task.stop          (added in phase 2)
-#   POST /v2/task.delete        (added in phase 2)
+#   GET  /v2/task.listMessages  ?task_id=<id>&order=desc&limit=N
+#                               returns {ok, messages, has_more, next_cursor}.
+#                               status_update events carry agent_status ∈
+#                                 {running, stopped, waiting, error}.
+#                               'stopped' is terminal (success or user-cancel).
+#                               assistant_message events carry the final reply.
+#   POST /v2/task.stop          body: {"task_id":"<id>"}   resp: {ok, request_id}
 #
 # Auth: every request needs header  x-manus-api-key: <key>
 # API key is read via a temporary header file (curl -H @file) — never passed
 # on the command line. The header file lives under $TMPDIR with mode 600 and
 # is removed on exit.
 #
-# Phase 1: only `create` is implemented end-to-end. status/result/cancel are
-# stubs that print "not yet implemented".
+# Subcommands: create | status | result | cancel
 
 set -euo pipefail
 
@@ -147,19 +148,174 @@ cmd_create() {
   rm -f "$resp_file" "$err_file"
 }
 
+# --- Shared HTTP helper with rate_limited backoff ---------------------------
+#
+# Usage: http_call <method> <path> [body]  → echoes path to a file containing
+# the parsed JSON response. Caller reads with jq and rm's the file. Retries
+# rate_limited with exponential backoff (1s, 2s, 4s; max 3 attempts).
+
+http_call() {
+  local method="$1" path="$2" body="${3:-}"
+  local resp_file err_file http_code attempt=0 sleep_secs=1
+
+  resp_file=$(mktemp -t manus-resp.XXXXXX)
+  err_file=$(mktemp -t manus-err.XXXXXX)
+
+  while :; do
+    : > "$resp_file" : > "$err_file"
+    if [ "$method" = "GET" ]; then
+      http_code=$(curl -sS -w '%{http_code}' -o "$resp_file" \
+        -H @"$HEADER_FILE" \
+        "$BASE_URL$path" \
+        2> >(scrub_stderr >"$err_file") || true)
+    else
+      http_code=$(curl -sS -w '%{http_code}' -o "$resp_file" \
+        -H @"$HEADER_FILE" \
+        -X "$method" "$BASE_URL$path" \
+        --data "${body:-{}}" \
+        2> >(scrub_stderr >"$err_file") || true)
+    fi
+
+    if [ "$http_code" = "200" ]; then
+      echo "$resp_file"
+      rm -f "$err_file"
+      return 0
+    fi
+
+    local err_code
+    err_code=$(jq -r '.error.code // empty' "$resp_file" 2>/dev/null || true)
+    if [ "$err_code" = "rate_limited" ] && [ "$attempt" -lt 2 ]; then
+      sleep "$sleep_secs"
+      sleep_secs=$((sleep_secs * 2))
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    echo "manus-client: $method $path failed (HTTP $http_code, code=$err_code)" >&2
+    [ -s "$err_file" ] && cat "$err_file" >&2
+    [ -s "$resp_file" ] && cat "$resp_file" >&2
+    rm -f "$resp_file" "$err_file"
+    return 1
+  done
+}
+
+# Pull the most recent status_update.agent_status from a listMessages response.
+# Returns one of: running | stopped | waiting | error | unknown
+extract_agent_status() {
+  local resp_file="$1"
+  local s
+  s=$(jq -r '
+    .messages
+    | map(select(.type == "status_update"))
+    | first(.[]? | .status_update.agent_status // empty)
+    // empty
+  ' "$resp_file")
+  if [ -z "$s" ]; then
+    s=$(jq -r '
+      .messages
+      | map(select(.type == "status_update"))
+      | first(.[]? | (.agent_status // .status_update.agent_status // empty))
+      // empty
+    ' "$resp_file")
+  fi
+  echo "${s:-unknown}"
+}
+
+# Pull the most recent assistant_message text from a listMessages response.
+# When messages are ordered desc (newest first), the first assistant_message is
+# the final reply. .assistant_message.content is a plain string in v2.
+extract_assistant_text() {
+  local resp_file="$1"
+  jq -r '
+    [ .messages[]? | select(.type == "assistant_message") ]
+    | first
+    | (.assistant_message.content // .content // "")
+    | if type == "array" then map(.text // .) | join("\n") else . end
+  ' "$resp_file" 2>/dev/null | head -c 65536
+}
+
+# --- status / result / cancel -----------------------------------------------
+
 cmd_status() {
-  echo "manus-client: status not yet implemented (phase 2)" >&2
-  return 2
+  local task_id="${1:?usage: manus-client.sh status <task_id>}"
+  make_header_file
+
+  local resp_file
+  resp_file=$(http_call GET "/v2/task.listMessages?task_id=$task_id&order=desc&limit=20") || return 1
+
+  local status state_file
+  status=$(extract_agent_status "$resp_file")
+  state_file="$STATE_DIR/$task_id.json"
+
+  if [ -f "$state_file" ]; then
+    local tmp
+    tmp=$(mktemp -t manus-state.XXXXXX)
+    jq --arg s "$status" --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '.status = $s | .last_checked_at = $checked' \
+      "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+  fi
+
+  jq -n --arg id "$task_id" --arg s "$status" --arg state "$state_file" \
+    '{ok:true, task_id:$id, status:$s, state_file:$state}'
+
+  rm -f "$resp_file"
 }
 
 cmd_result() {
-  echo "manus-client: result not yet implemented (phase 2)" >&2
-  return 2
+  local task_id="${1:?usage: manus-client.sh result <task_id>}"
+  make_header_file
+
+  local resp_file
+  resp_file=$(http_call GET "/v2/task.listMessages?task_id=$task_id&order=desc&limit=50") || return 1
+
+  local status text
+  status=$(extract_agent_status "$resp_file")
+  text=$(extract_assistant_text "$resp_file")
+
+  local state_file="$STATE_DIR/$task_id.json"
+  if [ -f "$state_file" ] && [ -n "$text" ]; then
+    local tmp
+    tmp=$(mktemp -t manus-state.XXXXXX)
+    jq --arg s "$status" \
+       --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       --arg r "$text" \
+       '.status = $s | .last_checked_at = $checked | .result = $r' \
+       "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+  fi
+
+  jq -n \
+    --arg id "$task_id" \
+    --arg s "$status" \
+    --arg text "$text" \
+    --arg state "$state_file" \
+    '{ok:true, task_id:$id, status:$s, result:$text, state_file:$state}'
+
+  rm -f "$resp_file"
 }
 
 cmd_cancel() {
-  echo "manus-client: cancel not yet implemented (phase 2)" >&2
-  return 2
+  local task_id="${1:?usage: manus-client.sh cancel <task_id>}"
+  make_header_file
+
+  local body
+  body=$(jq -nc --arg id "$task_id" '{task_id:$id}')
+
+  local resp_file
+  resp_file=$(http_call POST "/v2/task.stop" "$body") || return 1
+
+  local state_file="$STATE_DIR/$task_id.json"
+  if [ -f "$state_file" ]; then
+    local tmp
+    tmp=$(mktemp -t manus-state.XXXXXX)
+    jq --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       '.status = "stopped" | .cancelled_at = $checked' \
+       "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+  fi
+
+  jq -n --arg id "$task_id" --arg state "$state_file" \
+    '{ok:true, task_id:$id, status:"stopped", state_file:$state}'
+
+  rm -f "$resp_file"
 }
 
 usage() {
@@ -168,9 +324,9 @@ usage: manus-client.sh <command> [args]
 
 commands:
   create <query>     Dispatch a research task; writes state file; prints JSON
-  status <task_id>   (phase 2) Fetch current task status
-  result <task_id>   (phase 2) Fetch final task result
-  cancel <task_id>   (phase 2) Cancel a running task
+  status <task_id>   Fetch current agent_status; update state file
+  result <task_id>   Fetch latest assistant_message text and current status
+  cancel <task_id>   Stop a running task
 
 env:
   MANUS_API_KEY      Overrides config api_key
