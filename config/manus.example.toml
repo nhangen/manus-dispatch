@@ -1,5 +1,5 @@
 # Manus Research plugin config.
-# Copy to ~/.config/manus-research/config.toml and edit.
+# Copy to ~/.config/manus-dispatch/config.toml and edit.
 
 # Manus API key. Either set api_key directly, or set api_key_cmd to a shell
 # command that prints the key on stdout (e.g. for keychain integration).
@@ -13,6 +13,6 @@ obsidian_enabled = false
 obsidian_path = ""
 
 # Soft daily credit warning. The plugin does NOT enforce this — it surfaces
-# a warning in /manus-research output when today's spend exceeds the cap.
+# a warning in /manus-dispatch output when today's spend exceeds the cap.
 # Set to 0 to disable.
 daily_credit_cap = 0

@@ -1,4 +1,4 @@
-# manus-research
+# manus-dispatch
 
 Dispatch long-running research tasks to the [Manus](https://manus.im) AI agent
 platform from Claude Code via slash command. Manus does the heavy autonomous
@@ -6,7 +6,7 @@ research; Claude orchestrates and synthesizes the result back into your session.
 
 ## What it does
 
-- `/manus-research <query>` — dispatches a research task to Manus, returns a
+- `/manus-dispatch <query>` — dispatches a research task to Manus, returns a
   task id immediately. No background polling.
 - `/manus-status [task-id]` — pulls status for all running tasks (or one by id);
   surfaces completed results back into the conversation.
@@ -34,8 +34,8 @@ API-key only.
 ## Setup
 
 1. Get an API key from <https://open.manus.im/docs> (Authentication section).
-2. `mkdir -p ~/.config/manus-research`
-3. Copy `config/manus.example.toml` to `~/.config/manus-research/config.toml`
+2. `mkdir -p ~/.config/manus-dispatch`
+3. Copy `config/manus.example.toml` to `~/.config/manus-dispatch/config.toml`
    and fill in your key.
 4. Install the plugin via the `nhangen-tools` marketplace.
 

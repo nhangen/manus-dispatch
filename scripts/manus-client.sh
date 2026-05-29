@@ -24,7 +24,7 @@ set -euo pipefail
 
 : "${HOME:?HOME must be set}"
 
-CONFIG_DIR="$HOME/.config/manus-research"
+CONFIG_DIR="$HOME/.config/manus-dispatch"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 STATE_DIR="$CONFIG_DIR/state"
 BASE_URL="${MANUS_BASE_URL:-https://api.manus.ai}"
