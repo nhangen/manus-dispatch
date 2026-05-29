@@ -4,16 +4,16 @@ Dispatch long-running research tasks to the [Manus](https://manus.im) AI agent
 platform from Claude Code via slash command. Manus does the heavy autonomous
 research; Claude orchestrates and synthesizes the result back into your session.
 
-## What it does
+## Slash commands
 
-- `/manus-dispatch <query>` — dispatches a research task to Manus, returns a
-  task id immediately. No background polling.
-- `/manus-status [task-id]` — pulls status for all running tasks (or one by id);
-  surfaces completed results back into the conversation.
-- `/manus-cancel <task-id>` — cancels a running task.
+- `/manus-dispatch <query>` — dispatch a research task. Returns immediately
+  with a task id; no background polling.
+- `/manus-dispatch:status [task_id]` — pull status (and result if completed)
+  for one task, or for every still-running task if no id is given.
+- `/manus-dispatch:cancel <task_id>` — best-effort stop.
 
-Optional Obsidian filing writes completed results to
-`<vault>/Projects/Research/manus/<YYYY-MM-DD>-<slug>.md` when configured.
+The plugin also ships `scripts/manus-client.sh`, which you can call directly
+outside Claude Code: `manus-client.sh create|status|result|cancel`.
 
 ## Why
 
@@ -28,21 +28,79 @@ Manus is credit-based (~$0.005/credit). A research task typically burns
 500–900 credits ($2.50–$4.50). The plugin only fires on explicit slash
 command invocation — there is no auto-dispatch.
 
-OAuth is not supported by Manus as of May 2026 (Q3 2026 roadmap). Auth is
-API-key only.
+Auth is API-key only in this plugin; Manus also supports OAuth2 in v2, but
+for a personal Claude Code plugin the key is simpler. See
+<https://open.manus.ai/docs/v2/oauth> if you need scoped tokens.
 
 ## Setup
 
-1. Get an API key from <https://open.manus.im/docs> (Authentication section).
-2. `mkdir -p ~/.config/manus-dispatch`
-3. Copy `config/manus.example.toml` to `~/.config/manus-dispatch/config.toml`
-   and fill in your key.
-4. Install the plugin via the `nhangen-tools` marketplace.
+1. Install via the `nhangen-tools` marketplace:
+   ```bash
+   claude plugin marketplace add nhangen/claude-plugins
+   claude plugin install manus-dispatch@nhangen-tools
+   ```
+2. Get an API key from <https://open.manus.ai/docs/v2/authentication>.
+3. Create config:
+   ```bash
+   mkdir -p ~/.config/manus-dispatch
+   cp <plugin>/config/manus.example.toml ~/.config/manus-dispatch/config.toml
+   $EDITOR ~/.config/manus-dispatch/config.toml
+   ```
+4. Either set `api_key` directly, set `api_key_cmd` to a keychain helper, or
+   export `MANUS_API_KEY` in your shell — env wins.
+
+## Obsidian filing (optional)
+
+Set `obsidian_enabled = true` and `obsidian_path = "/path/to/vault"` in the
+config. When a result is fetched, it's written to
+`<vault>/Projects/Research/manus/<YYYY-MM-DD>-<slug>.md` with frontmatter,
+and a link is appended under `## Research` in today's daily note
+(`<vault>/Daily/<YYYY-MM-DD>.md`).
+
+If `obsidian_enabled = true` and `obsidian_path` is empty or non-existent,
+the plugin aborts with a diagnostic (exit 3) — no silent fall-through to
+disabled. See [`enum-config-typo-fallback`](https://github.com/nhangen/manus-dispatch).
+
+## Endpoints
+
+Targets the Manus v2 API:
+
+| Subcommand | Method + path | Notes |
+|---|---|---|
+| `create` | `POST /v2/task.create` | `{"message":{"content":[{"type":"text","text":"..."}]}}` |
+| `status` | `GET /v2/task.listMessages` | parses `agent_status` from latest `status_update` event |
+| `result` | `GET /v2/task.listMessages` | same, plus extracts most recent `assistant_message.content` |
+| `cancel` | `POST /v2/task.stop` | marks state file `cancelled_at` |
+
+`agent_status` ∈ `{running, stopped, waiting, error}`. `stopped` is terminal
+for both successful completion and user cancellation — the state file's
+`cancelled_at` field distinguishes them.
+
+## State
+
+Runtime state lives outside the plugin tree at
+`~/.config/manus-dispatch/state/<task_id>.json`. One file per task, persisted
+across sessions. Polling is on-demand only — no background processes.
+
+## Security
+
+- API key passed via a temp header file (`curl -H @file`, mode 600,
+  trap-cleanup) — never on the command line or in process args.
+- `curl` stderr is scrubbed to drop any `x-manus-api-key` / `Authorization`
+  lines before surfacing.
+- `rate_limited` errors back off exponentially (1s, 2s, 4s; max 3 attempts).
 
 ## Status
 
-v0.1.0 — early. Phase 1 (CLI client + scaffolding) implemented; slash commands
-and Obsidian filing land in v0.2/v0.3.
+v0.1.0 — CLI client, three slash commands, optional Obsidian filing, and
+config validation are all functional and smoke-tested against the live
+Manus v2 API.
+
+Not yet implemented:
+- PreToolUse hook for hard cost-gating (currently soft via slash-command
+  invocation only)
+- Codex integration
+- Webhook receiver (polling is on-demand only)
 
 ## License
 
