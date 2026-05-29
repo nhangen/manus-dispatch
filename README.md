@@ -15,7 +15,7 @@ research; Claude orchestrates and synthesizes the result back into your session.
 The plugin also ships `scripts/manus-client.sh`, which you can call directly
 outside Claude Code: `manus-client.sh create|status|result|cancel`.
 
-## Auto-notify on completed tasks (v0.1.1)
+## Auto-notify on completed tasks
 
 Two hooks point at the same script `hooks/notify-completed.sh`:
 
@@ -124,8 +124,8 @@ across sessions. Polling is on-demand only — no background processes.
 
 ## Status
 
-v0.1.1 — CLI client, three slash commands, optional Obsidian filing, config
-validation, and SessionStart auto-notify hook are all functional and
+v0.1.2 — CLI client, three slash commands, optional Obsidian filing, config
+validation, and SessionStart+Stop auto-notify hooks are all functional and
 smoke-tested against the live Manus v2 API.
 
 Not yet implemented:
