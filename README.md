@@ -15,6 +15,28 @@ research; Claude orchestrates and synthesizes the result back into your session.
 The plugin also ships `scripts/manus-client.sh`, which you can call directly
 outside Claude Code: `manus-client.sh create|status|result|cancel`.
 
+## Auto-notify on next session (v0.1.1)
+
+A `SessionStart` hook walks the state dir and, for every task that hasn't
+been surfaced yet, calls `manus-client.sh result` and injects a one-line
+summary into the new session as `additionalContext`. So if you dispatch a
+task, close Claude Code, and open it again later, you'll see:
+
+```
+## Manus tasks
+
+Completed since last session:
+• <task title> → <obsidian note path>
+• <task title> (task <id>)
+
+Still running: N task(s). Run /manus-dispatch:status for details.
+```
+
+Cost: zero extra Claude turns (hooks run local bash, not model invocations).
+The hook marks `notified_at` in each state file so it won't re-fire on the
+next session. Skips silently when no state dir, no API key, or no
+unsurfaced tasks. Cross-platform — no scheduler, no public endpoint.
+
 ## Why
 
 Manus runs autonomous research tasks (browse, read, synthesize, write) that
@@ -92,15 +114,15 @@ across sessions. Polling is on-demand only — no background processes.
 
 ## Status
 
-v0.1.0 — CLI client, three slash commands, optional Obsidian filing, and
-config validation are all functional and smoke-tested against the live
-Manus v2 API.
+v0.1.1 — CLI client, three slash commands, optional Obsidian filing, config
+validation, and SessionStart auto-notify hook are all functional and
+smoke-tested against the live Manus v2 API.
 
 Not yet implemented:
 - PreToolUse hook for hard cost-gating (currently soft via slash-command
   invocation only)
 - Codex integration
-- Webhook receiver (polling is on-demand only)
+- Webhook receiver (polling is on-demand + SessionStart only)
 
 ## License
 
