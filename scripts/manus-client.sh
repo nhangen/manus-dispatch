@@ -32,6 +32,26 @@ BASE_URL="${MANUS_BASE_URL:-https://api.manus.ai}"
 
 mkdir -p "$STATE_DIR"
 
+# Validate obsidian config at parse time (per enum-config-typo-fallback).
+# When obsidian_enabled = true, obsidian_path MUST be a non-empty existing
+# directory — abort with a diagnostic, do not silently disable filing.
+if [ -f "$CONFIG_FILE" ]; then
+  _obs_enabled_check=$(awk -F '=' '/^[[:space:]]*obsidian_enabled[[:space:]]*=/ {v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}' "$CONFIG_FILE")
+  if [ "$_obs_enabled_check" = "true" ] || [ "$_obs_enabled_check" = "1" ]; then
+    _obs_path_check=$(awk -F '=' '/^[[:space:]]*obsidian_path[[:space:]]*=/ {v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); gsub(/^"|"$/, "", v); print v; exit}' "$CONFIG_FILE")
+    if [ -z "$_obs_path_check" ]; then
+      echo "manus-client: obsidian_enabled = true but obsidian_path is empty in $CONFIG_FILE" >&2
+      echo "manus-client: set obsidian_path to your vault directory or set obsidian_enabled = false" >&2
+      exit 3
+    fi
+    if [ ! -d "$_obs_path_check" ]; then
+      echo "manus-client: obsidian_path '$_obs_path_check' does not exist" >&2
+      exit 3
+    fi
+  fi
+  unset _obs_enabled_check _obs_path_check
+fi
+
 # --- API key resolution ------------------------------------------------------
 #
 # Precedence: MANUS_API_KEY env var > config.toml api_key > config.toml api_key_cmd
@@ -59,6 +79,50 @@ resolve_api_key() {
   fi
   echo "manus-client: no api_key or api_key_cmd in $CONFIG_FILE" >&2
   return 1
+}
+
+# --- Obsidian config -------------------------------------------------------
+#
+# Read a string field from the config TOML. Tolerant of quoted/unquoted values.
+read_config_string() {
+  local field="$1"
+  [ -f "$CONFIG_FILE" ] || return 0
+  awk -F '=' -v f="$field" '
+    $0 ~ "^[[:space:]]*" f "[[:space:]]*=" {
+      v=$2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      gsub(/^"|"$/, "", v)
+      print v
+      exit
+    }
+  ' "$CONFIG_FILE"
+}
+
+read_config_bool() {
+  local v
+  v=$(read_config_string "$1")
+  case "$v" in true|1|yes) echo 1 ;; *) echo 0 ;; esac
+}
+
+# Resolve obsidian config; per enum-config-typo-fallback, when enabled the
+# path MUST be non-empty. Returns 0 with stdout = vault path when enabled and
+# valid, 1 with diagnostic when enabled-but-misconfigured, 2 when disabled.
+resolve_obsidian() {
+  local enabled path
+  enabled=$(read_config_bool obsidian_enabled)
+  if [ "$enabled" != "1" ]; then
+    return 2
+  fi
+  path=$(read_config_string obsidian_path)
+  if [ -z "$path" ]; then
+    echo "manus-client: obsidian_enabled = true but obsidian_path is empty in $CONFIG_FILE" >&2
+    return 1
+  fi
+  if [ ! -d "$path" ]; then
+    echo "manus-client: obsidian_path '$path' is not a directory" >&2
+    return 1
+  fi
+  printf '%s' "$path"
 }
 
 # --- Header file (key never on command line) --------------------------------
@@ -169,10 +233,11 @@ http_call() {
         "$BASE_URL$path" \
         2> >(scrub_stderr >"$err_file") || true)
     else
+      local _body="${body:-\{\}}"
       http_code=$(curl -sS -w '%{http_code}' -o "$resp_file" \
         -H @"$HEADER_FILE" \
         -X "$method" "$BASE_URL$path" \
-        --data "${body:-{}}" \
+        --data "$_body" \
         2> >(scrub_stderr >"$err_file") || true)
     fi
 
@@ -234,6 +299,71 @@ extract_assistant_text() {
   ' "$resp_file" 2>/dev/null | head -c 65536
 }
 
+# --- Obsidian filing --------------------------------------------------------
+#
+# Write a research result to <vault>/Projects/Research/manus/<date>-<slug>.md.
+# Best-effort daily-note link append under ## Research.
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
+    | cut -c1-60
+}
+
+file_to_obsidian() {
+  local task_id="$1" title="$2" query="$3" result="$4" task_url="$5"
+
+  local vault
+  vault=$(resolve_obsidian)
+  local rc=$?
+  case $rc in
+    2) return 0 ;;        # disabled, no-op
+    1) return 1 ;;        # enabled-but-misconfigured (already aborted upstream)
+  esac
+
+  local date_str slug note_dir note_path
+  date_str=$(date +%Y-%m-%d)
+  slug=$(slugify "${title:-$query}")
+  [ -n "$slug" ] || slug="manus-$task_id"
+  note_dir="$vault/Projects/Research/manus"
+  note_path="$note_dir/$date_str-$slug.md"
+  mkdir -p "$note_dir"
+
+  {
+    printf -- '---\n'
+    printf 'date: %s\n' "$date_str"
+    printf 'source: manus\n'
+    printf 'task_id: %s\n' "$task_id"
+    printf 'task_url: %s\n' "$task_url"
+    printf 'tags: [manus, research]\n'
+    printf -- '---\n\n'
+    printf '# %s\n\n' "${title:-Manus research}"
+    printf '## Query\n\n%s\n\n' "$query"
+    printf '## Result\n\n%s\n' "$result"
+  } > "$note_path"
+
+  local daily="$vault/Daily/$date_str.md"
+  if [ -f "$daily" ]; then
+    local rel_path="../Projects/Research/manus/$date_str-$slug.md"
+    local link_line
+    link_line=$(printf -- '- [%s](%s)' "${title:-Manus research}" "$rel_path")
+    if ! grep -qF -- "$link_line" "$daily"; then
+      if grep -q '^## Research' "$daily"; then
+        awk -v line="$link_line" '
+          /^## Research/ { print; print line; inserted=1; next }
+          { print }
+          END { if (!inserted) {} }
+        ' "$daily" > "$daily.tmp" && mv "$daily.tmp" "$daily"
+      else
+        printf '\n## Research\n\n%s\n' "$link_line" >> "$daily"
+      fi
+    fi
+  fi
+
+  printf '%s' "$note_path"
+}
+
 # --- status / result / cancel -----------------------------------------------
 
 cmd_status() {
@@ -273,14 +403,26 @@ cmd_result() {
   text=$(extract_assistant_text "$resp_file")
 
   local state_file="$STATE_DIR/$task_id.json"
-  if [ -f "$state_file" ] && [ -n "$text" ]; then
-    local tmp
-    tmp=$(mktemp -t manus-state.XXXXXX)
-    jq --arg s "$status" \
-       --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-       --arg r "$text" \
-       '.status = $s | .last_checked_at = $checked | .result = $r' \
-       "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+  local title query task_url note_path=""
+  if [ -f "$state_file" ]; then
+    title=$(jq -r '.title // empty' "$state_file")
+    query=$(jq -r '.query // empty' "$state_file")
+    task_url=$(jq -r '.task_url // empty' "$state_file")
+    if [ -n "$text" ]; then
+      local tmp
+      tmp=$(mktemp -t manus-state.XXXXXX)
+      jq --arg s "$status" \
+         --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+         --arg r "$text" \
+         '.status = $s | .last_checked_at = $checked | .result = $r' \
+         "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+
+      note_path=$(file_to_obsidian "$task_id" "$title" "$query" "$text" "$task_url") || note_path=""
+      if [ -n "$note_path" ] && [ -f "$note_path" ]; then
+        tmp=$(mktemp -t manus-state.XXXXXX)
+        jq --arg p "$note_path" '.obsidian_note = $p' "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+      fi
+    fi
   fi
 
   jq -n \
@@ -288,7 +430,8 @@ cmd_result() {
     --arg s "$status" \
     --arg text "$text" \
     --arg state "$state_file" \
-    '{ok:true, task_id:$id, status:$s, result:$text, state_file:$state}'
+    --arg note "$note_path" \
+    '{ok:true, task_id:$id, status:$s, result:$text, state_file:$state, obsidian_note:(if $note == "" then null else $note end)}'
 
   rm -f "$resp_file"
 }
