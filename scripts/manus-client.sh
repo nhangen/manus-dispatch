@@ -142,6 +142,29 @@ resolve_obsidian_vault() {
   printf '%s' "$path"
 }
 
+# Read daily_path from the obsidian plugin's obsidian.local.md frontmatter.
+# Defaults to "Daily/" when unset. Trailing slash is stripped. Returns 0 always;
+# stdout is the (possibly default) relative path.
+read_obsidian_daily_path() {
+  local plugin_root plugin_dir local_md path
+  plugin_root="$HOME/.claude/plugins/cache/nhangen/obsidian"
+  plugin_dir=$(ls -1d "$plugin_root"/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/$::')
+  local_md="$plugin_dir/obsidian.local.md"
+  if [ -f "$local_md" ]; then
+    path=$(awk '
+      /^---[[:space:]]*$/ { fm = !fm; next }
+      fm && /^daily_path:[[:space:]]*/ {
+        sub(/^daily_path:[[:space:]]*/, "", $0)
+        gsub(/^"|"$/, "", $0)
+        print
+        exit
+      }
+    ' "$local_md")
+  fi
+  path="${path:-Daily/}"
+  printf '%s' "${path%/}"
+}
+
 # --- Header file (key never on command line) --------------------------------
 
 HEADER_FILE=""
@@ -328,8 +351,6 @@ slugify() {
     | cut -c1-60
 }
 
-# Strip Markdown headings, code fences, list bullets, blank lines; return the
-# first ~200 chars of usable prose as a one-line summary for the daily note.
 summarize_result() {
   printf '%s' "$1" \
     | awk '
@@ -376,11 +397,10 @@ file_to_obsidian() {
     printf '## Result\n\n%s\n' "$result"
   } > "$note_path"
 
-  # Daily-note append. Create the daily if absent (matching the
-  # `date:`/`tags:[daily]` frontmatter convention used elsewhere in the vault),
-  # create the `## Research` section if absent, dedupe by task_id.
-  local daily_dir="$vault/Daily"
-  local daily="$daily_dir/$date_str.md"
+  local daily_rel daily_dir daily
+  daily_rel=$(read_obsidian_daily_path)
+  daily_dir="$vault/$daily_rel"
+  daily="$daily_dir/$date_str.md"
   mkdir -p "$daily_dir"
   if [ ! -f "$daily" ]; then
     {
@@ -394,7 +414,16 @@ file_to_obsidian() {
 
   local summary rel_path entry_marker entry
   summary=$(summarize_result "$result")
-  rel_path="../Projects/Research/manus/$date_str-$slug.md"
+  local up_segments=""
+  local _segs="${daily_rel%/}"
+  while [ -n "$_segs" ]; do
+    up_segments="../$up_segments"
+    case "$_segs" in
+      */*) _segs="${_segs%/*}" ;;
+      *)   _segs="" ;;
+    esac
+  done
+  rel_path="${up_segments}Projects/Research/manus/$date_str-$slug.md"
   entry_marker="<!-- manus:$task_id -->"
   if grep -qF "$entry_marker" "$daily"; then
     printf '%s' "$note_path"
@@ -423,17 +452,23 @@ file_to_obsidian() {
 # error events; falls back to a generic string. Never returns empty.
 extract_failure_reason() {
   local resp_file="$1"
-  local reason
+  local reason jq_err
+  jq_err=$(mktemp -t manus-jqerr.XXXXXX)
   reason=$(jq -r '
     [ .messages[]? | select(.type == "error" or .type == "status_update") ]
     | map(.error.message // .status_update.error // .status_update.detail // empty)
     | map(select(. != null and . != ""))
     | first // empty
-  ' "$resp_file" 2>/dev/null)
+  ' "$resp_file" 2>"$jq_err")
   reason=$(printf '%s' "$reason" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-200)
   if [ -z "$reason" ]; then
-    reason="agent_status=error"
+    if [ -s "$jq_err" ]; then
+      reason="error: failed to parse response ($(head -c 80 "$jq_err" | tr '\n' ' '))"
+    else
+      reason="error: agent_status=error, no message in response (head=$(head -c 80 "$resp_file" | tr -d '\n' | sed 's/"/\\"/g'))"
+    fi
   fi
+  rm -f "$jq_err"
   printf '%s' "$reason"
 }
 
@@ -556,10 +591,20 @@ cmd_result() {
          '.status = $s | .last_checked_at = $checked | .result = $r' \
          "$state_file" > "$tmp" && mv "$tmp" "$state_file"
 
-      note_path=$(file_to_obsidian "$task_id" "$title" "$query" "$text" "$task_url") || note_path=""
-      if [ -n "$note_path" ] && [ -f "$note_path" ]; then
+      local file_rc=0
+      note_path=$(file_to_obsidian "$task_id" "$title" "$query" "$text" "$task_url") || file_rc=$?
+      if [ "$file_rc" -eq 0 ] && [ -n "$note_path" ] && [ -f "$note_path" ]; then
         tmp=$(mktemp -t manus-state.XXXXXX)
         jq --arg p "$note_path" '.obsidian_note = $p' "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+      elif [ "$file_rc" -eq 1 ]; then
+        note_path=""
+        tmp=$(mktemp -t manus-state.XXXXXX)
+        jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+           '.obsidian_failed_at = $ts' \
+           "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+        echo "manus-client: obsidian filing failed for task $task_id (vault misconfigured); will retry on next result fetch" >&2
+      else
+        note_path=""
       fi
     fi
   fi
