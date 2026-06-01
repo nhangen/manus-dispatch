@@ -83,15 +83,54 @@ for a personal Claude Code plugin the key is simpler. See
 
 ## Obsidian filing (optional)
 
-Set `obsidian_enabled = true` and `obsidian_path = "/path/to/vault"` in the
-config. When a result is fetched, it's written to
-`<vault>/Projects/Research/manus/<YYYY-MM-DD>-<slug>.md` with frontmatter,
-and a link is appended under `## Research` in today's daily note
-(`<vault>/Daily/<YYYY-MM-DD>.md`).
+Set `obsidian_enabled = true` in `~/.config/manus-dispatch/config.toml`.
+Vault path is read from the `nhangen/obsidian` plugin's local config
+(`~/.claude/plugins/cache/nhangen/obsidian/<latest>/obsidian.local.md`,
+`vault_path:` frontmatter) — no hardcoded path in this plugin.
 
-If `obsidian_enabled = true` and `obsidian_path` is empty or non-existent,
-the plugin aborts with a diagnostic (exit 3) — no silent fall-through to
-disabled. See [`enum-config-typo-fallback`](https://github.com/nhangen/manus-dispatch).
+### On success
+
+When `cmd_result` fetches a completed task:
+
+1. A research note is written to
+   `<vault>/Projects/Research/manus/<YYYY-MM-DD>-<slug>.md` with frontmatter.
+2. Today's daily note at `<vault>/Daily/<YYYY-MM-DD>.md` gets an entry under
+   `## Research` (section created if absent; daily file created with
+   `date:`/`tags:[daily]` frontmatter if absent):
+
+   ```markdown
+   - [<title>](../Projects/Research/manus/<date>-<slug>.md) — task `<id>` — [Manus](<url>) <!-- manus:<id> -->
+     <first-200-chars of result, headings/code stripped>
+   ```
+
+   Entries are deduped by the `<!-- manus:<id> -->` marker.
+
+### On failure
+
+When `agent_status == "error"`, the plugin writes one line to
+`<vault>/CEO/inbox.md`:
+
+```markdown
+- [ ] Manus task `<id>` (<title>) failed: <reason> — [Manus](<url>)
+```
+
+Per `ceo-automated-writers-are-playbooks`, this writer requires a
+`manus-dispatch-failures` entry in the vault's `CEO/registry.json`. Without
+it the inbox write is skipped (diagnostic on stderr) and the failure is
+still tracked on the per-task state file. See
+[`docs/playbooks/manus-dispatch-failures.md`](docs/playbooks/manus-dispatch-failures.md)
+for the registry JSON to copy into `claude-ceo`.
+
+Idempotency: one inbox line per task ever (gated by `.failure_reported_at`
+on the state file). Re-fetches are no-ops.
+
+### Failure modes
+
+- `obsidian_enabled = true` + plugin not installed → diagnostic, filing
+  skipped, task JSON still returned.
+- Plugin installed + `vault_path:` missing/invalid → same.
+- Success path is independent of `CEO/registry.json` — only the failure
+  path is gated by the registry entry.
 
 ## Endpoints
 
