@@ -32,25 +32,10 @@ BASE_URL="${MANUS_BASE_URL:-https://api.manus.ai}"
 
 mkdir -p "$STATE_DIR"
 
-# Validate obsidian config at parse time (per enum-config-typo-fallback).
-# When obsidian_enabled = true, obsidian_path MUST be a non-empty existing
-# directory — abort with a diagnostic, do not silently disable filing.
-if [ -f "$CONFIG_FILE" ]; then
-  _obs_enabled_check=$(awk -F '=' '/^[[:space:]]*obsidian_enabled[[:space:]]*=/ {v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}' "$CONFIG_FILE")
-  if [ "$_obs_enabled_check" = "true" ] || [ "$_obs_enabled_check" = "1" ]; then
-    _obs_path_check=$(awk -F '=' '/^[[:space:]]*obsidian_path[[:space:]]*=/ {v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); gsub(/^"|"$/, "", v); print v; exit}' "$CONFIG_FILE")
-    if [ -z "$_obs_path_check" ]; then
-      echo "manus-client: obsidian_enabled = true but obsidian_path is empty in $CONFIG_FILE" >&2
-      echo "manus-client: set obsidian_path to your vault directory or set obsidian_enabled = false" >&2
-      exit 3
-    fi
-    if [ ! -d "$_obs_path_check" ]; then
-      echo "manus-client: obsidian_path '$_obs_path_check' does not exist" >&2
-      exit 3
-    fi
-  fi
-  unset _obs_enabled_check _obs_path_check
-fi
+# Vault path is sourced from the obsidian plugin's own local config (single
+# source of truth — no hardcoded duplicate in this plugin). Validation is
+# lazy inside resolve_obsidian_vault so non-Obsidian users aren't blocked at
+# import time.
 
 # --- API key resolution ------------------------------------------------------
 #
@@ -104,22 +89,54 @@ read_config_bool() {
   case "$v" in true|1|yes) echo 1 ;; *) echo 0 ;; esac
 }
 
-# Resolve obsidian config; per enum-config-typo-fallback, when enabled the
-# path MUST be non-empty. Returns 0 with stdout = vault path when enabled and
-# valid, 1 with diagnostic when enabled-but-misconfigured, 2 when disabled.
-resolve_obsidian() {
-  local enabled path
+# Resolve vault from the obsidian plugin's own local config.
+#
+# Single source of truth: ~/.claude/plugins/cache/nhangen/obsidian/<latest>/
+# obsidian.local.md (YAML frontmatter `vault_path:`). Version segment is
+# resolved dynamically so plugin bumps don't break this lookup.
+#
+# Returns 0 with stdout = vault path when enabled and valid.
+# Returns 1 with diagnostic when enabled-but-not-resolvable.
+# Returns 2 (silent) when manus-dispatch's obsidian_enabled is false.
+resolve_obsidian_vault() {
+  local enabled
   enabled=$(read_config_bool obsidian_enabled)
   if [ "$enabled" != "1" ]; then
     return 2
   fi
-  path=$(read_config_string obsidian_path)
+
+  local plugin_root plugin_dir local_md path
+  plugin_root="$HOME/.claude/plugins/cache/nhangen/obsidian"
+  if [ ! -d "$plugin_root" ]; then
+    echo "manus-client: obsidian_enabled = true but obsidian plugin not installed at $plugin_root" >&2
+    echo "manus-client: install nhangen/obsidian plugin or set obsidian_enabled = false" >&2
+    return 1
+  fi
+  plugin_dir=$(ls -1d "$plugin_root"/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/$::')
+  if [ -z "$plugin_dir" ]; then
+    echo "manus-client: obsidian plugin dir empty under $plugin_root" >&2
+    return 1
+  fi
+  local_md="$plugin_dir/obsidian.local.md"
+  if [ ! -f "$local_md" ]; then
+    echo "manus-client: $local_md not found — configure the obsidian plugin first" >&2
+    return 1
+  fi
+  path=$(awk '
+    /^---[[:space:]]*$/ { fm = !fm; next }
+    fm && /^vault_path:[[:space:]]*/ {
+      sub(/^vault_path:[[:space:]]*/, "", $0)
+      gsub(/^"|"$/, "", $0)
+      print
+      exit
+    }
+  ' "$local_md")
   if [ -z "$path" ]; then
-    echo "manus-client: obsidian_enabled = true but obsidian_path is empty in $CONFIG_FILE" >&2
+    echo "manus-client: vault_path missing from $local_md" >&2
     return 1
   fi
   if [ ! -d "$path" ]; then
-    echo "manus-client: obsidian_path '$path' is not a directory" >&2
+    echo "manus-client: vault_path '$path' (from $local_md) is not a directory" >&2
     return 1
   fi
   printf '%s' "$path"
@@ -311,15 +328,31 @@ slugify() {
     | cut -c1-60
 }
 
+# Strip Markdown headings, code fences, list bullets, blank lines; return the
+# first ~200 chars of usable prose as a one-line summary for the daily note.
+summarize_result() {
+  printf '%s' "$1" \
+    | awk '
+        /^[[:space:]]*```/ { in_code = !in_code; next }
+        in_code { next }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        { sub(/^[[:space:]]*[-*+][[:space:]]+/, ""); print; exit }
+      ' \
+    | tr '\n' ' ' \
+    | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' \
+    | cut -c1-200
+}
+
 file_to_obsidian() {
   local task_id="$1" title="$2" query="$3" result="$4" task_url="$5"
 
   local vault
-  vault=$(resolve_obsidian)
+  vault=$(resolve_obsidian_vault)
   local rc=$?
   case $rc in
     2) return 0 ;;        # disabled, no-op
-    1) return 1 ;;        # enabled-but-misconfigured (already aborted upstream)
+    1) return 1 ;;        # enabled-but-misconfigured (diagnostic already emitted)
   esac
 
   local date_str slug note_dir note_path
@@ -343,25 +376,109 @@ file_to_obsidian() {
     printf '## Result\n\n%s\n' "$result"
   } > "$note_path"
 
-  local daily="$vault/Daily/$date_str.md"
-  if [ -f "$daily" ]; then
-    local rel_path="../Projects/Research/manus/$date_str-$slug.md"
-    local link_line
-    link_line=$(printf -- '- [%s](%s)' "${title:-Manus research}" "$rel_path")
-    if ! grep -qF -- "$link_line" "$daily"; then
-      if grep -q '^## Research' "$daily"; then
-        awk -v line="$link_line" '
-          /^## Research/ { print; print line; inserted=1; next }
-          { print }
-          END { if (!inserted) {} }
-        ' "$daily" > "$daily.tmp" && mv "$daily.tmp" "$daily"
-      else
-        printf '\n## Research\n\n%s\n' "$link_line" >> "$daily"
-      fi
-    fi
+  # Daily-note append. Create the daily if absent (matching the
+  # `date:`/`tags:[daily]` frontmatter convention used elsewhere in the vault),
+  # create the `## Research` section if absent, dedupe by task_id.
+  local daily_dir="$vault/Daily"
+  local daily="$daily_dir/$date_str.md"
+  mkdir -p "$daily_dir"
+  if [ ! -f "$daily" ]; then
+    {
+      printf -- '---\n'
+      printf 'date: %s\n' "$date_str"
+      printf 'tags: [daily]\n'
+      printf -- '---\n\n'
+      printf '# %s\n' "$date_str"
+    } > "$daily"
+  fi
+
+  local summary rel_path entry_marker entry
+  summary=$(summarize_result "$result")
+  rel_path="../Projects/Research/manus/$date_str-$slug.md"
+  entry_marker="<!-- manus:$task_id -->"
+  if grep -qF "$entry_marker" "$daily"; then
+    printf '%s' "$note_path"
+    return 0
+  fi
+
+  entry=$(printf -- '- [%s](%s) — task `%s` — [Manus](%s) %s\n  %s' \
+    "${title:-Manus research}" "$rel_path" "$task_id" "${task_url:-#}" \
+    "$entry_marker" "${summary:-(no summary)}")
+
+  if grep -q '^## Research' "$daily"; then
+    awk -v line="$entry" '
+      BEGIN { inserted=0 }
+      /^## Research/ && !inserted { print; getline blank; if (blank ~ /^[[:space:]]*$/) { print blank } else { print ""; print blank }; print line; inserted=1; next }
+      { print }
+      END { if (!inserted) { print ""; print "## Research"; print ""; print line } }
+    ' "$daily" > "$daily.tmp" && mv "$daily.tmp" "$daily"
+  else
+    printf '\n## Research\n\n%s\n' "$entry" >> "$daily"
   fi
 
   printf '%s' "$note_path"
+}
+
+# Pull a short failure reason from a listMessages response. Looks for explicit
+# error events; falls back to a generic string. Never returns empty.
+extract_failure_reason() {
+  local resp_file="$1"
+  local reason
+  reason=$(jq -r '
+    [ .messages[]? | select(.type == "error" or .type == "status_update") ]
+    | map(.error.message // .status_update.error // .status_update.detail // empty)
+    | map(select(. != null and . != ""))
+    | first // empty
+  ' "$resp_file" 2>/dev/null)
+  reason=$(printf '%s' "$reason" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-200)
+  if [ -z "$reason" ]; then
+    reason="agent_status=error"
+  fi
+  printf '%s' "$reason"
+}
+
+# Append a single failure line to <vault>/CEO/inbox.md, once per task.
+#
+# Per ~/.claude/rules/ceo-automated-writers-are-playbooks.md any automated
+# writer to the CEO vault must be a registered playbook. We require the
+# vault's CEO/registry.json to list a `manus-dispatch-failures` entry before
+# writing. If the entry is missing we emit a diagnostic and skip — better to
+# silently no-op than to spam an unsanctioned inbox.
+#
+# Idempotency is handled by the caller via the `.failure_reported_at` field
+# on the per-task state file; once set, we don't re-enter this function for
+# the same task.
+report_failure_to_inbox() {
+  local task_id="$1" title="$2" reason="$3" task_url="$4"
+
+  local vault
+  vault=$(resolve_obsidian_vault)
+  local rc=$?
+  case $rc in
+    2) return 0 ;;
+    1) return 1 ;;
+  esac
+
+  local registry="$vault/CEO/registry.json"
+  if [ ! -f "$registry" ]; then
+    echo "manus-client: $registry missing — failure not reported to CEO/inbox.md" >&2
+    return 1
+  fi
+  if ! jq -e '.playbooks[]? | select(.name == "manus-dispatch-failures")' "$registry" >/dev/null 2>&1; then
+    echo "manus-client: CEO/registry.json missing 'manus-dispatch-failures' playbook — failure not reported" >&2
+    echo "manus-client: register the writer per docs/playbooks/manus-dispatch-failures.md" >&2
+    return 1
+  fi
+
+  local inbox="$vault/CEO/inbox.md"
+  mkdir -p "$vault/CEO"
+  [ -f "$inbox" ] || printf '# Inbox\n\n' > "$inbox"
+
+  local line url_part=""
+  [ -n "$task_url" ] && url_part=" — [Manus]($task_url)"
+  line=$(printf -- '- [ ] Manus task `%s` (%s) failed: %s%s' \
+    "$task_id" "${title:-untitled}" "$reason" "$url_part")
+  printf '%s\n' "$line" >> "$inbox"
 }
 
 # --- status / result / cancel -----------------------------------------------
@@ -408,8 +525,30 @@ cmd_result() {
     title=$(jq -r '.title // empty' "$state_file")
     query=$(jq -r '.query // empty' "$state_file")
     task_url=$(jq -r '.task_url // empty' "$state_file")
-    if [ -n "$text" ]; then
-      local tmp
+    local tmp
+
+    if [ "$status" = "error" ]; then
+      local already_reported reason
+      already_reported=$(jq -r '.failure_reported_at // empty' "$state_file")
+      if [ -z "$already_reported" ]; then
+        reason=$(extract_failure_reason "$resp_file")
+        if report_failure_to_inbox "$task_id" "$title" "$reason" "$task_url"; then
+          tmp=$(mktemp -t manus-state.XXXXXX)
+          jq --arg s "$status" \
+             --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             --arg reason "$reason" \
+             '.status = $s | .last_checked_at = $checked
+              | .failure_reported_at = $ts | .failure_reason = $reason' \
+             "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+        else
+          tmp=$(mktemp -t manus-state.XXXXXX)
+          jq --arg s "$status" --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             '.status = $s | .last_checked_at = $checked' \
+             "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+        fi
+      fi
+    elif [ -n "$text" ]; then
       tmp=$(mktemp -t manus-state.XXXXXX)
       jq --arg s "$status" \
          --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
