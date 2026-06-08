@@ -1,6 +1,6 @@
 ---
 name: manus-dispatch
-description: Dispatch a long-running research task to the Manus AI agent platform. Returns immediately with a task id; poll later with /manus-dispatch:status. Usage: /manus-dispatch <research query>
+description: Dispatch a long-running research task to the Manus AI agent platform. Returns immediately with a task id; poll later with /manus-dispatch:manus-status. Usage: /manus-dispatch <research query>
 ---
 
 # Dispatch a research task to Manus
@@ -21,7 +21,7 @@ The user invoked this command with a query: `$ARGUMENTS`
    - `task_id` (so they can reference it later)
    - `task_url` (so they can watch progress in the Manus web UI)
    - State file path
-   - A note that they should run `/manus-dispatch:status` later to pull the result
+   - A note that they should run `/manus-dispatch:manus-status` later to pull the result
 
 ## Error handling
 

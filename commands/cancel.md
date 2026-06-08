@@ -22,5 +22,5 @@ The user invoked this command with arguments: `$ARGUMENTS`
 ## Notes
 
 - Manus uses the same `stopped` agent_status for "completed normally" and "user-cancelled" — the state file's `cancelled_at` field is how the plugin distinguishes them.
-- Cancellation is best-effort: Manus may have already completed work by the time the stop request lands. Run `/manus-dispatch:status <id>` afterward to see the final state.
+- Cancellation is best-effort: Manus may have already completed work by the time the stop request lands. Run `/manus-dispatch:manus-status <id>` afterward to see the final state.
 - Credits already consumed cannot be refunded; cancel saves only credits from work not yet done.

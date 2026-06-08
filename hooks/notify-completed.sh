@@ -8,7 +8,7 @@
 #
 # Walks the state dir, calls manus-client.sh result for each task that hasn't
 # been notified yet, and emits additionalContext so Claude sees what came
-# back without you having to run /manus-dispatch:status manually.
+# back without you having to run /manus-dispatch:manus-status manually.
 #
 # Skips silently when:
 # - no state dir
@@ -94,7 +94,7 @@ done
     echo
   fi
   if [ "$still_running" -gt 0 ]; then
-    echo "Still running: ${still_running} task(s). Run /manus-dispatch:status for details."
+    echo "Still running: ${still_running} task(s). Run /manus-dispatch:manus-status for details."
   fi
 } | jq -Rs --arg evt "$HOOK_EVENT" '{
   hookSpecificOutput: {

@@ -8,7 +8,7 @@ research; Claude orchestrates and synthesizes the result back into your session.
 
 - `/manus-dispatch <query>` — dispatch a research task. Returns immediately
   with a task id; no background polling.
-- `/manus-dispatch:status [task_id]` — pull status (and result if completed)
+- `/manus-dispatch:manus-status [task_id]` — pull status (and result if completed)
   for one task, or for every still-running task if no id is given.
 - `/manus-dispatch:cancel <task_id>` — best-effort stop.
 
@@ -34,7 +34,7 @@ Completed since last session:
 • <task title> → <obsidian note path>
 • <task title> (task <id>)
 
-Still running: N task(s). Run /manus-dispatch:status for details.
+Still running: N task(s). Run /manus-dispatch:manus-status for details.
 ```
 
 Cost: zero extra Claude turns (hooks run local bash, not model

@@ -7,7 +7,7 @@ User-triggered writer to `CEO/inbox.md` for failed Manus tasks.
 Event-driven, not cron. Fires inside `scripts/manus-client.sh result` when a
 task's `agent_status` is `error`. The result call itself runs only when the
 user has Claude Code open (SessionStart/Stop hook in `hooks/notify-completed.sh`)
-or runs `/manus-dispatch:status` manually.
+or runs `/manus-dispatch:manus-status` manually.
 
 ## Outputs
 
@@ -63,7 +63,7 @@ Add to `CEO/registry.json` (via the claude-ceo repo):
 The May 2026 disk-monitor incident was a cron writer appending to
 `CEO/inbox/disk-alert.md` every hour. This writer is fundamentally different:
 it only runs when the user already has Claude Code in the foreground (hook
-fires) or invokes `/manus-dispatch:status` directly. It cannot generate
+fires) or invokes `/manus-dispatch:manus-status` directly. It cannot generate
 unbounded background noise.
 
 ## Origin

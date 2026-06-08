@@ -1,6 +1,6 @@
 ---
-name: status
-description: Pull current status (and result if completed) for one or all running Manus tasks. Usage: /manus-dispatch:status [task_id]
+name: manus-status
+description: Pull current status (and result if completed) for one or all running Manus tasks. Usage: /manus-dispatch:manus-status [task_id]
 ---
 
 # Pull Manus task status
