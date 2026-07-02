@@ -38,14 +38,16 @@ CLIENT="${CLAUDE_PLUGIN_ROOT:-$HOME/ML-AI/claude/manus-dispatch}/scripts/manus-c
 [ -x "$CLIENT" ] || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 
-# Find candidates: status != "stopped", OR status == "stopped" without notified_at.
+# Find candidates: any task not yet surfaced (no notified_at). Once a task has
+# been surfaced it is done — regardless of its status — so it is never a
+# candidate again. Gating purely on notified_at (rather than "status !=
+# stopped") is what stops a terminal-but-non-stopped task, e.g. one that ended
+# in `error`, from being re-selected on every hook fire forever.
 candidates=()
 for f in "$STATE_DIR"/*.json; do
   [ -f "$f" ] || continue
   needs_check=$(jq -r '
-    if .status != "stopped" then "yes"
-    elif (.notified_at // null) == null then "yes"
-    else "no" end
+    if (.notified_at // null) == null then "yes" else "no" end
   ' "$f" 2>/dev/null || echo "no")
   [ "$needs_check" = "yes" ] && candidates+=("$f")
 done
@@ -64,22 +66,39 @@ for f in "${candidates[@]}"; do
     continue
   fi
 
+  # Only `running` is genuinely in-flight. Every other status is terminal for
+  # our purposes — `stopped` (success/cancel), `error` (failed), `waiting`
+  # (needs input), or anything unrecognized — so surface it once and mark it
+  # notified. The old code counted every non-`stopped` status as "still
+  # running" and never marked it notified, so an errored task was re-counted
+  # and re-polled on every hook fire, in every session, forever.
   status=$(jq -r '.status // "unknown"' "$f")
-  if [ "$status" = "stopped" ]; then
-    title=$(jq -r '.title // .query // "untitled"' "$f")
-    note=$(jq -r '.obsidian_note // ""' "$f")
-    if [ -n "$note" ] && [ "$note" != "null" ]; then
-      completed_lines+=("• ${title} → ${note}")
-    else
-      completed_lines+=("• ${title} (task ${task_id})")
-    fi
-    # Mark notified so we don't surface it again
-    tmp=$(mktemp -t manus-state.XXXXXX)
-    jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.notified_at = $t' "$f" > "$tmp" \
-      && mv "$tmp" "$f"
-  else
-    still_running=$((still_running + 1))
-  fi
+  title=$(jq -r '.title // .query // "untitled"' "$f")
+  case "$status" in
+    running)
+      still_running=$((still_running + 1))
+      continue  # leave notified_at unset so we re-check it next fire
+      ;;
+    stopped)
+      note=$(jq -r '.obsidian_note // ""' "$f")
+      if [ -n "$note" ] && [ "$note" != "null" ]; then
+        completed_lines+=("• ${title} → ${note}")
+      else
+        completed_lines+=("• ${title} (task ${task_id})")
+      fi
+      ;;
+    waiting)
+      completed_lines+=("• ${title} — waiting for input (task ${task_id})")
+      ;;
+    *)
+      completed_lines+=("• ${title} — ended: ${status} (task ${task_id})")
+      ;;
+  esac
+
+  # Mark notified so a terminal task is never surfaced or re-polled again.
+  tmp=$(mktemp -t manus-state.XXXXXX)
+  jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.notified_at = $t' "$f" > "$tmp" \
+    && mv "$tmp" "$f"
 done
 
 [ "${#completed_lines[@]}" -gt 0 ] || [ "$still_running" -gt 0 ] || exit 0
