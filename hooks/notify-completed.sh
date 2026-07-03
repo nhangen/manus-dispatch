@@ -61,23 +61,43 @@ for f in "${candidates[@]}"; do
   task_id=$(jq -r '.task_id' "$f" 2>/dev/null)
   [ -n "$task_id" ] && [ "$task_id" != "null" ] || continue
 
-  # Best-effort fetch; ignore failures (bad key, network, rate limit).
-  if ! "$CLIENT" result "$task_id" >/dev/null 2>&1; then
-    continue
-  fi
-
-  # Only `running` is genuinely in-flight. Every other status is terminal for
-  # our purposes — `stopped` (success/cancel), `error` (failed), `waiting`
-  # (needs input), or anything unrecognized — so surface it once and mark it
-  # notified. The old code counted every non-`stopped` status as "still
-  # running" and never marked it notified, so an errored task was re-counted
-  # and re-polled on every hook fire, in every session, forever.
-  status=$(jq -r '.status // "unknown"' "$f")
+  # Best-effort fetch. Classify on the status the client itself just fetched
+  # (its stdout JSON), NOT on the state file: manus-client.sh only writes
+  # .status back for `error` and text-bearing results, so a `waiting` task or
+  # one cancelled in the Manus UI (`stopped` with no assistant text) keeps a
+  # stale `running` in its state file. Reading the state file there would send
+  # those tasks down the `running` arm and re-poll them forever — the exact
+  # loop this hook is meant to avoid. Ignore fetch failures (bad key, network,
+  # rate limit): notified_at stays unset, so the task is retried next fire.
+  resp=$("$CLIENT" result "$task_id" 2>/dev/null) || continue
+  status=$(printf '%s' "$resp" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
   title=$(jq -r '.title // .query // "untitled"' "$f")
+
+  # `running` and `waiting` are both non-terminal: a waiting task resumes once
+  # the user supplies input and then completes, so neither may be marked
+  # notified (that would suppress the eventual completion). Only genuinely
+  # terminal statuses — `stopped`, `error`, anything unrecognized — are
+  # surfaced once and marked notified below.
   case "$status" in
     running)
       still_running=$((still_running + 1))
-      continue  # leave notified_at unset so we re-check it next fire
+      continue
+      ;;
+    waiting)
+      # Announce "needs input" once (tracked separately from notified_at) so
+      # we neither spam it every fire nor lose the completion notice later.
+      seen=$(jq -r '.waiting_notified_at // ""' "$f")
+      if [ -z "$seen" ] || [ "$seen" = "null" ]; then
+        completed_lines+=("• ${title} — waiting for input (task ${task_id})")
+        tmp=$(mktemp -t manus-state.XXXXXX)
+        if jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.waiting_notified_at = $t' "$f" > "$tmp"; then
+          mv "$tmp" "$f"
+        else
+          rm -f "$tmp"
+          echo "notify-completed: failed to mark $f waiting-notified" >&2
+        fi
+      fi
+      continue
       ;;
     stopped)
       note=$(jq -r '.obsidian_note // ""' "$f")
@@ -87,18 +107,21 @@ for f in "${candidates[@]}"; do
         completed_lines+=("• ${title} (task ${task_id})")
       fi
       ;;
-    waiting)
-      completed_lines+=("• ${title} — waiting for input (task ${task_id})")
-      ;;
     *)
       completed_lines+=("• ${title} — ended: ${status} (task ${task_id})")
       ;;
   esac
 
   # Mark notified so a terminal task is never surfaced or re-polled again.
+  # Guard the write: on jq failure, don't leave a leaked temp file behind and
+  # don't silently drop the mark (which would re-surface the task next fire).
   tmp=$(mktemp -t manus-state.XXXXXX)
-  jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.notified_at = $t' "$f" > "$tmp" \
-    && mv "$tmp" "$f"
+  if jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.notified_at = $t' "$f" > "$tmp"; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+    echo "notify-completed: failed to mark $f notified" >&2
+  fi
 done
 
 [ "${#completed_lines[@]}" -gt 0 ] || [ "$still_running" -gt 0 ] || exit 0
