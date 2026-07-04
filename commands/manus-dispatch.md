@@ -14,7 +14,7 @@ The user invoked this command with a query: `$ARGUMENTS`
 2. Run the create call:
 
 ```bash
-~/.claude/plugins/cache/nhangen/manus-dispatch/0.1.0/scripts/manus-client.sh create "$ARGUMENTS"
+"${CLAUDE_PLUGIN_ROOT:-$HOME/ML-AI/claude/manus-dispatch}/scripts/manus-client.sh" create "$ARGUMENTS"
 ```
 
 3. Parse the JSON response and report back to the user:
