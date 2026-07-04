@@ -14,7 +14,7 @@ The user invoked this command with arguments: `$ARGUMENTS`
 2. Run the cancel call:
 
 ```bash
-~/.claude/plugins/cache/nhangen/manus-dispatch/0.1.0/scripts/manus-client.sh cancel "$ARGUMENTS"
+"${CLAUDE_PLUGIN_ROOT:-$HOME/ML-AI/claude/manus-dispatch}/scripts/manus-client.sh" cancel "$ARGUMENTS"
 ```
 
 3. Report the result. On success the script updates the state file to `status: stopped` and records `cancelled_at`.

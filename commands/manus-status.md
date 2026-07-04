@@ -14,7 +14,7 @@ The user invoked this command with arguments: `$ARGUMENTS`
 Run both status and result against the given task_id:
 
 ```bash
-~/.claude/plugins/cache/nhangen/manus-dispatch/0.1.0/scripts/manus-client.sh result "$ARGUMENTS"
+"${CLAUDE_PLUGIN_ROOT:-$HOME/ML-AI/claude/manus-dispatch}/scripts/manus-client.sh" result "$ARGUMENTS"
 ```
 
 The `result` subcommand returns status + assistant text in one call (it fetches a larger message page than `status` alone). Report the status; if the result text is non-empty, surface it back into the conversation so the user can read or have you synthesize it.
@@ -29,7 +29,7 @@ for f in ~/.config/manus-dispatch/state/*.json; do
   s=$(jq -r '.status' "$f")
   id=$(jq -r '.task_id' "$f")
   if [ "$s" = "running" ]; then
-    ~/.claude/plugins/cache/nhangen/manus-dispatch/0.1.0/scripts/manus-client.sh result "$id"
+    "${CLAUDE_PLUGIN_ROOT:-$HOME/ML-AI/claude/manus-dispatch}/scripts/manus-client.sh" result "$id"
   fi
 done
 ```

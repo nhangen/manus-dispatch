@@ -1,6 +1,6 @@
 {
   "name": "manus-dispatch",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Dispatch long-running research tasks to the Manus AI agent platform from Claude Code via slash command. On-demand polling plus SessionStart hook that surfaces newly-completed tasks on the next session, optional Obsidian filing, explicit-invocation cost gating.",
   "author": {
     "name": "nhangen"
