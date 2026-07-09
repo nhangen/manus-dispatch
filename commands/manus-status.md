@@ -45,4 +45,4 @@ If no state files exist, tell the user there are no tracked tasks and suggest `/
 
 - Polling is on-demand only. No background process.
 - Once a result is fetched it's written into the state file at `.result` — subsequent calls don't re-fetch the full message log.
-- If `obsidian_enabled = true` in config, completed results should also be written to the Obsidian vault. (Phase 3 — not yet implemented in the client.)
+- If `obsidian_enabled = true` in config, completed results are also written to the Obsidian vault (see `file_to_obsidian` in `manus-client.sh`, wired into `cmd_result`).
