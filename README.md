@@ -163,7 +163,7 @@ across sessions. Polling is on-demand only — no background processes.
 
 ## Status
 
-v0.1.2 — CLI client, three slash commands, optional Obsidian filing, config
+v0.1.5 — CLI client, three slash commands, optional Obsidian filing, config
 validation, and SessionStart+Stop auto-notify hooks are all functional and
 smoke-tested against the live Manus v2 API.
 

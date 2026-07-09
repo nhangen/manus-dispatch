@@ -17,7 +17,6 @@ api_key = "manus-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # manus-client invocation will emit a diagnostic and skip filing.
 obsidian_enabled = false
 
-# Soft daily credit warning. The plugin does NOT enforce this — it surfaces
-# a warning in /manus-dispatch output when today's spend exceeds the cap.
-# Set to 0 to disable.
+# Daily credit cap (not yet enforced — no code path reads or checks this
+# value). Reserved for a future soft-warning feature. Set to 0 to disable.
 daily_credit_cap = 0
