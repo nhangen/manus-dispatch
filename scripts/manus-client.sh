@@ -9,7 +9,10 @@
 #                               status_update events carry agent_status ∈
 #                                 {running, stopped, waiting, error}.
 #                               'stopped' is terminal (success or user-cancel).
-#                               assistant_message events carry the final reply.
+#                               assistant_message events carry the final reply,
+#                               and optionally .attachments[] — the deliverable
+#                               as a file, with a pre-signed (expiring)
+#                               manuscdn.com URL that takes no API key.
 #   POST /v2/task.stop          body: {"task_id":"<id>"}   resp: {ok, request_id}
 #
 # Auth: every request needs header  x-manus-api-key: <key>
@@ -17,7 +20,7 @@
 # on the command line. The header file lives under $TMPDIR with mode 600 and
 # is removed on exit.
 #
-# Subcommands: create | status | result | cancel
+# Subcommands: create | status | result | files | download | cancel
 
 set -euo pipefail
 
@@ -326,6 +329,85 @@ extract_agent_status() {
   echo "${s:-unknown}"
 }
 
+# Pull attachments from a listMessages response as a compact JSON array of
+# {filename, content_type, url}. Emits `[]` when there are none.
+#
+# Shape (confirmed against the live v2 API, task AziNZbJ4YnEjV3dA7dE8Jf):
+#   .messages[] | select(.type=="assistant_message")
+#     | .assistant_message.attachments[] = {type, filename, content_type, url}
+# The url is a PRE-SIGNED manuscdn.com link (CloudFront Policy/Signature in the
+# query string) — it needs no Manus API key, and must never be sent one (see
+# cmd_download). It also EXPIRES, which is why we surface it rather than cache it.
+#
+# Messages arrive newest-first (order=desc), so the final reply's attachments
+# come first. Dedupe by url while preserving that order.
+#
+# A parse failure must NOT degrade to "[]": reporting zero attachments for a
+# body we couldn't read is precisely the silent-payload-loss bug this whole
+# path exists to fix. On failure we emit a diagnostic and return non-zero, so
+# every caller either propagates the error or is visibly wrong.
+extract_attachments() {
+  local resp_file="$1" out jq_err rc=0
+  jq_err=$(mktemp -t manus-jqerr.XXXXXX)
+  out=$(jq -c '
+    [ .messages[]?
+      | select(.type == "assistant_message")
+      | .assistant_message.attachments[]?
+      | select((.url // "") != "")
+      | { filename: (.filename // "attachment"),
+          content_type: (.content_type // ""),
+          url: .url }
+    ]
+    | reduce .[] as $a ([]; if any(.[]; .url == $a.url) then . else . + [$a] end)
+  ' "$resp_file" 2>"$jq_err") || rc=$?
+
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    echo "manus-client: could not parse attachments from the API response — treating this as an error, not as 'no attachments' (jq: $(head -c 200 "$jq_err" | tr '\n' ' '))" >&2
+    rm -f "$jq_err"
+    return 1
+  fi
+  rm -f "$jq_err"
+  printf '%s' "$out"
+}
+
+# We read one page of messages, so "no attachments found" is only trustworthy
+# when we saw the whole log. If the page was truncated AND we found nothing,
+# say so — otherwise a long task's attachments look like an absence of
+# attachments, which is the same silent-omission failure in a new place.
+warn_if_truncated() {
+  local resp_file="$1" atts="$2"
+  [ "$(printf '%s' "$atts" | jq -r 'length' 2>/dev/null || echo 0)" = "0" ] || return 0
+  local has_more
+  has_more=$(jq -r '.has_more // false' "$resp_file" 2>/dev/null || echo false)
+  [ "$has_more" = "true" ] || return 0
+  echo "manus-client: no attachments in the most recent messages, but the log is longer than one page (has_more=true) — an attachment on an older message would not be visible here" >&2
+}
+
+# Reduce an attachments array to a short human line: "2 file(s): a.md, b.csv".
+# Empty string when there are none.
+describe_attachments() {
+  printf '%s' "$1" | jq -r '
+    if length == 0 then ""
+    else "\(length) file(s): " + (map(.filename) | join(", "))
+    end
+  ' 2>/dev/null || true
+}
+
+# Sanitize an API-supplied filename into a safe basename. The filename is
+# untrusted input: strip any directory component so a crafted
+# "../../.ssh/authorized_keys" can't escape the output dir, and refuse names
+# that reduce to nothing or to a dot-entry.
+safe_basename() {
+  local name="$1" base
+  base=${name##*/}
+  base=${base//\\//}
+  base=${base##*/}
+  base=$(printf '%s' "$base" | tr -d '\000-\037' | sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^\.+//')
+  base=$(printf '%s' "$base" | cut -c1-120)
+  [ -n "$base" ] || return 1
+  printf '%s' "$base"
+}
+
 # Pull the most recent assistant_message text from a listMessages response.
 # When messages are ordered desc (newest first), the first assistant_message is
 # the final reply. .assistant_message.content is a plain string in v2.
@@ -366,7 +448,7 @@ summarize_result() {
 }
 
 file_to_obsidian() {
-  local task_id="$1" title="$2" query="$3" result="$4" task_url="$5"
+  local task_id="$1" title="$2" query="$3" result="$4" task_url="$5" atts="${6:-[]}"
 
   local vault
   vault=$(resolve_obsidian_vault)
@@ -394,7 +476,15 @@ file_to_obsidian() {
     printf -- '---\n\n'
     printf '# %s\n\n' "${title:-Manus research}"
     printf '## Query\n\n%s\n\n' "$query"
-    printf '## Result\n\n%s\n' "$result"
+    printf '## Result\n\n%s\n' "${result:-_(no summary text — the deliverable is attached, see below)_}"
+    # The signed URLs expire, so record the filenames and the command that
+    # re-fetches them rather than pasting links that rot inside the vault.
+    if [ "$(printf '%s' "$atts" | jq -r 'length')" != "0" ]; then
+      printf '\n## Attachments\n\n'
+      printf '%s' "$atts" | jq -r '.[] | "- `\(.filename)` — \(.content_type)"'
+      printf '\nManus serves these as expiring signed URLs. Fetch them with:\n\n'
+      printf '```bash\nmanus-client.sh download %s\n```\n' "$task_id"
+    fi
   } > "$note_path"
 
   local daily_rel daily_dir daily
@@ -414,6 +504,11 @@ file_to_obsidian() {
 
   local summary rel_path entry_marker entry
   summary=$(summarize_result "$result")
+  local att_desc
+  att_desc=$(describe_attachments "$atts")
+  if [ -n "$att_desc" ]; then
+    summary="${summary:+$summary }📎 $att_desc"
+  fi
   local up_segments=""
   local _segs="${daily_rel%/}"
   while [ -n "$_segs" ]; do
@@ -525,20 +620,27 @@ cmd_status() {
   local resp_file
   resp_file=$(http_call GET "/v2/task.listMessages?task_id=$task_id&order=desc&limit=20") || return 1
 
-  local status state_file
+  local status state_file atts rc=0
   status=$(extract_agent_status "$resp_file")
+  atts=$(extract_attachments "$resp_file") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$resp_file"
+    return 1
+  fi
   state_file="$STATE_DIR/$task_id.json"
 
   if [ -f "$state_file" ]; then
     local tmp
     tmp=$(mktemp -t manus-state.XXXXXX)
-    jq --arg s "$status" --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '.status = $s | .last_checked_at = $checked' \
+    jq --arg s "$status" --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson a "$atts" \
+      '.status = $s | .last_checked_at = $checked
+       | .attachments = ($a | map({filename, content_type}))' \
       "$state_file" > "$tmp" && mv "$tmp" "$state_file"
   fi
 
-  jq -n --arg id "$task_id" --arg s "$status" --arg state "$state_file" \
-    '{ok:true, task_id:$id, status:$s, state_file:$state}'
+  jq -n --arg id "$task_id" --arg s "$status" --arg state "$state_file" --argjson a "$atts" \
+    '{ok:true, task_id:$id, status:$s, state_file:$state,
+      attachment_count:($a|length), attachments:($a | map({filename, content_type}))}'
 
   rm -f "$resp_file"
 }
@@ -550,9 +652,17 @@ cmd_result() {
   local resp_file
   resp_file=$(http_call GET "/v2/task.listMessages?task_id=$task_id&order=desc&limit=50") || return 1
 
-  local status text
+  local status text atts att_count rc=0
   status=$(extract_agent_status "$resp_file")
   text=$(extract_assistant_text "$resp_file")
+  atts=$(extract_attachments "$resp_file") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Bail rather than file a note claiming a text-only result — a task whose
+    # payload is a file would be recorded as complete with the file dropped.
+    rm -f "$resp_file"
+    return 1
+  fi
+  att_count=$(printf '%s' "$atts" | jq -r 'length')
 
   local state_file="$STATE_DIR/$task_id.json"
   local title query task_url note_path=""
@@ -583,16 +693,18 @@ cmd_result() {
              "$state_file" > "$tmp" && mv "$tmp" "$state_file"
         fi
       fi
-    elif [ -n "$text" ]; then
+    elif [ -n "$text" ] || [ "$att_count" != "0" ]; then
       tmp=$(mktemp -t manus-state.XXXXXX)
       jq --arg s "$status" \
          --arg checked "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
          --arg r "$text" \
-         '.status = $s | .last_checked_at = $checked | .result = $r' \
+         --argjson a "$atts" \
+         '.status = $s | .last_checked_at = $checked | .result = $r
+          | .attachments = ($a | map({filename, content_type}))' \
          "$state_file" > "$tmp" && mv "$tmp" "$state_file"
 
       local file_rc=0
-      note_path=$(file_to_obsidian "$task_id" "$title" "$query" "$text" "$task_url") || file_rc=$?
+      note_path=$(file_to_obsidian "$task_id" "$title" "$query" "$text" "$task_url" "$atts") || file_rc=$?
       if [ "$file_rc" -eq 0 ] && [ -n "$note_path" ] && [ -f "$note_path" ]; then
         tmp=$(mktemp -t manus-state.XXXXXX)
         jq --arg p "$note_path" '.obsidian_note = $p' "$state_file" > "$tmp" && mv "$tmp" "$state_file"
@@ -615,9 +727,144 @@ cmd_result() {
     --arg text "$text" \
     --arg state "$state_file" \
     --arg note "$note_path" \
-    '{ok:true, task_id:$id, status:$s, result:$text, state_file:$state, obsidian_note:(if $note == "" then null else $note end)}'
+    --argjson a "$atts" \
+    '{ok:true, task_id:$id, status:$s, result:$text, state_file:$state,
+      obsidian_note:(if $note == "" then null else $note end),
+      attachment_count:($a|length),
+      attachments:($a | map({filename, content_type})),
+      attachment_hint:(if ($a|length) > 0
+        then "deliverable includes \($a|length) file(s); fetch with: manus-client.sh download \($id)"
+        else null end)}'
 
   rm -f "$resp_file"
+}
+
+cmd_files() {
+  local task_id="${1:?usage: manus-client.sh files <task_id>}"
+  make_header_file
+
+  local resp_file
+  resp_file=$(http_call GET "/v2/task.listMessages?task_id=$task_id&order=desc&limit=50") || return 1
+
+  local atts rc=0
+  atts=$(extract_attachments "$resp_file") || rc=$?
+  warn_if_truncated "$resp_file" "$atts"
+  rm -f "$resp_file"
+  [ "$rc" -eq 0 ] || return 1
+
+  jq -n --arg id "$task_id" --argjson a "$atts" \
+    '{ok:true, task_id:$id, count:($a|length), attachments:$a}'
+}
+
+# Download a task's attachments to a local directory.
+#
+# The URLs are pre-signed CDN links, so the download runs WITHOUT the Manus
+# auth header — sending x-manus-api-key to manuscdn.com would hand our key to a
+# host that does not need it (see ~/.claude/rules/no-secrets-in-logs.md). The
+# flip side is expiry: a signed URL older than its Policy window returns 403,
+# which we report as a re-fetch instruction rather than a generic HTTP error.
+cmd_download() {
+  local task_id="" out_dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="${2:?--out requires a directory}"; shift 2 ;;
+      --out=*) out_dir="${1#--out=}"; shift ;;
+      -*) echo "manus-client: unknown download flag: $1" >&2; return 2 ;;
+      *) [ -z "$task_id" ] || { echo "manus-client: unexpected argument: $1" >&2; return 2; }
+         task_id="$1"; shift ;;
+    esac
+  done
+  [ -n "$task_id" ] || { echo "usage: manus-client.sh download <task_id> [--out DIR]" >&2; return 2; }
+  out_dir="${out_dir:-$CONFIG_DIR/files/$task_id}"
+
+  make_header_file
+
+  local resp_file
+  resp_file=$(http_call GET "/v2/task.listMessages?task_id=$task_id&order=desc&limit=50") || return 1
+  local atts extract_rc=0
+  atts=$(extract_attachments "$resp_file") || extract_rc=$?
+  warn_if_truncated "$resp_file" "$atts"
+  rm -f "$resp_file"
+  [ "$extract_rc" -eq 0 ] || return 1
+
+  local count
+  count=$(printf '%s' "$atts" | jq -r 'length')
+  if [ "$count" = "0" ]; then
+    jq -n --arg id "$task_id" '{ok:true, task_id:$id, count:0, files:[], note:"no attachments on this task"}'
+    return 0
+  fi
+
+  mkdir -p "$out_dir"
+
+  local saved="[]" failures=0 i=0 claimed=""
+  while [ "$i" -lt "$count" ]; do
+    local filename url base dest http_code err_file curl_rc
+    filename=$(printf '%s' "$atts" | jq -r ".[$i].filename")
+    url=$(printf '%s' "$atts" | jq -r ".[$i].url")
+    i=$((i + 1))
+
+    if ! base=$(safe_basename "$filename"); then
+      echo "manus-client: skipping attachment with unusable filename '$filename'" >&2
+      failures=$((failures + 1))
+      continue
+    fi
+    # Two attachments can share a filename (or collapse onto one after
+    # sanitizing). Suffix rather than let the second silently overwrite the
+    # first — losing half the deliverable is the bug this whole path fixes.
+    #
+    # Collision is judged against names claimed EARLIER IN THIS RUN, not
+    # against what's on disk: re-downloading a task must overwrite its own
+    # previous output, not accumulate a -2, -3, -4 copy per poll. The
+    # manus-status command re-runs download on every status check.
+    dest="$out_dir/$base"
+    case " $claimed " in
+      *" $base "*)
+        local stem ext n=2
+        case "$base" in
+          ?*.*) stem="${base%.*}"; ext=".${base##*.}" ;;
+          *)    stem="$base"; ext="" ;;
+        esac
+        while case " $claimed " in *" $stem-$n$ext "*) true ;; *) false ;; esac; do
+          n=$((n + 1))
+        done
+        base="$stem-$n$ext"
+        dest="$out_dir/$base"
+        ;;
+    esac
+    claimed="$claimed $base"
+
+    err_file=$(mktemp -t manus-dlerr.XXXXXX)
+    # No -H @"$HEADER_FILE" here — deliberate; see the comment above.
+    # curl's own exit status matters as much as the HTTP code: a transfer that
+    # dies mid-body (server closes early) still reports 200, and keeping that
+    # stub file would report half a deliverable as delivered.
+    curl_rc=0
+    http_code=$(curl -sS -L -w '%{http_code}' -o "$dest" "$url" 2>"$err_file") || curl_rc=$?
+
+    if [ "$http_code" != "200" ] || [ "$curl_rc" -ne 0 ]; then
+      rm -f "$dest"
+      if [ "$http_code" = "403" ]; then
+        echo "manus-client: '$base' download refused (HTTP 403) — the signed URL has expired; re-run 'files $task_id' for a fresh link" >&2
+      elif [ "$http_code" = "200" ]; then
+        echo "manus-client: '$base' transfer incomplete (HTTP 200 but curl exit $curl_rc) — partial file discarded" >&2
+      else
+        echo "manus-client: '$base' download failed (HTTP $http_code, curl exit $curl_rc)" >&2
+      fi
+      [ -s "$err_file" ] && scrub_stderr < "$err_file" >&2
+      rm -f "$err_file"
+      failures=$((failures + 1))
+      continue
+    fi
+    rm -f "$err_file"
+
+    saved=$(printf '%s' "$saved" | jq -c --arg f "${dest##*/}" --arg p "$dest" \
+      --arg b "$(wc -c < "$dest" | tr -d ' ')" '. + [{filename:$f, path:$p, bytes:($b|tonumber)}]')
+  done
+
+  jq -n --arg id "$task_id" --arg dir "$out_dir" --argjson f "$saved" --argjson fail "$failures" \
+    '{ok:($fail == 0), task_id:$id, out_dir:$dir, count:($f|length), failed:$fail, files:$f}'
+
+  [ "$failures" -eq 0 ]
 }
 
 cmd_cancel() {
@@ -653,6 +900,10 @@ commands:
   create <query>     Dispatch a research task; writes state file; prints JSON
   status <task_id>   Fetch current agent_status; update state file
   result <task_id>   Fetch latest assistant_message text and current status
+  files <task_id>    List the task's attachments (filename, type, signed URL)
+  download <task_id> [--out DIR]
+                     Download the task's attachments (default:
+                     ~/.config/manus-dispatch/files/<task_id>)
   cancel <task_id>   Stop a running task
 
 env:
@@ -669,6 +920,8 @@ main() {
     create) cmd_create "$@" ;;
     status) cmd_status "$@" ;;
     result) cmd_result "$@" ;;
+    files) cmd_files "$@" ;;
+    download) cmd_download "$@" ;;
     cancel) cmd_cancel "$@" ;;
     -h|--help|help) usage ;;
     *) echo "manus-client: unknown command: $cmd" >&2; usage; exit 2 ;;

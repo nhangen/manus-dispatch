@@ -100,11 +100,16 @@ for f in "${candidates[@]}"; do
       continue
       ;;
     stopped)
+      # An attached-file deliverable is easy to miss — the summary text reads as
+      # complete while the payload sits behind `download` (issue #6). Say so.
+      att=$(printf '%s' "$resp" | jq -r '.attachment_count // 0' 2>/dev/null || echo 0)
+      att_note=""
+      [ "$att" -gt 0 ] 2>/dev/null && att_note=" — 📎 ${att} file(s), fetch: manus-client.sh download ${task_id}"
       note=$(jq -r '.obsidian_note // ""' "$f")
       if [ -n "$note" ] && [ "$note" != "null" ]; then
-        completed_lines+=("• ${title} → ${note}")
+        completed_lines+=("• ${title} → ${note}${att_note}")
       else
-        completed_lines+=("• ${title} (task ${task_id})")
+        completed_lines+=("• ${title} (task ${task_id})${att_note}")
       fi
       ;;
     *)
