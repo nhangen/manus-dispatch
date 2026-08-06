@@ -147,8 +147,8 @@ Targets the Manus v2 API:
 |---|---|---|
 | `create` | `POST /v2/task.create` | `{"message":{"content":[{"type":"text","text":"..."}]}}` |
 | `status` | `GET /v2/task.listMessages` | parses `agent_status` from latest `status_update` event |
-| `result` | `GET /v2/task.listMessages` | same, plus extracts most recent `assistant_message.content` and its `attachments[]` |
-| `files` | `GET /v2/task.listMessages` | lists `assistant_message.attachments[]` (filename, content type, signed URL) |
+| `result` | `GET /v2/task.listMessages` | same, plus the most recent `assistant_message.content` and the `attachments[]` of every assistant message in the page |
+| `files` | `GET /v2/task.listMessages` | lists `assistant_message.attachments[]` (filename + content type; signed URL only with `--with-urls`) |
 | `download` | `GET /v2/task.listMessages` + CDN GET | fetches each attachment to `--out DIR` (default `~/.config/manus-dispatch/files/<task_id>`) |
 | `cancel` | `POST /v2/task.stop` | marks state file `cancelled_at` |
 
@@ -177,28 +177,37 @@ Two consequences worth knowing:
   reaches a third-party host. (Sending the key is what makes hand-rolled
   `curl` attempts against guessed API paths return 401 — there is no
   attachment endpoint to authenticate against.)
-- **The URL expires** (roughly a month from generation). Nothing caches it:
-  the state file and the Obsidian note record filenames only, and `files`
-  re-fetches a fresh link each call. An expired link surfaces as `HTTP 403`
-  with a re-run instruction, not a generic failure.
+- **The URL expires.** The `Policy` value carries the window; nothing here
+  parses it, so treat any link older than a few weeks as suspect. Nothing
+  caches it either: the state file and the Obsidian note record filenames only,
+  and every call re-fetches a fresh link. A refused link surfaces as `HTTP 403`
+  with a re-run instruction, not a generic failure. `files` withholds the URL
+  entirely unless `--with-urls` is passed — it is a bearer capability, and this
+  output ends up in Claude's context and from there in session notes.
 
 `result`, `status`, and the auto-notify hook all report `attachment_count` so a
 file deliverable can't look complete while the payload is missing. Because that
 silent omission is the whole bug, the retrieval path refuses to guess:
 
 - **An unparseable response is an error, not "no attachments."** If the JSON
-  can't be read, `files`/`download`/`result` exit non-zero with a diagnostic
-  rather than reporting `count: 0`.
+  can't be read, `status`/`result`/`files`/`download` exit non-zero with a
+  diagnostic rather than reporting `count: 0`.
+- **An attachment with no usable URL is counted and reported.** If the API
+  renames the field, the extraction would otherwise succeed and return an empty
+  list — the original bug under a new cause — so a drop is warned about loudly.
 - **A transfer that dies mid-body is a failure even at HTTP 200.** `curl`'s exit
   status is checked alongside the status code; a partial file is discarded, not
   counted. `download` exits non-zero if any attachment failed, and reports
   `failed: <n>` while still saving the ones that succeeded.
 - **`download` overwrites its own previous output** rather than accumulating
   `-2`, `-3` copies per poll. Two attachments that genuinely share a filename
-  within one response are suffixed so neither is lost.
-- **One page of messages is read (`limit=50`).** If nothing is found and the log
-  is longer than that page, `has_more` triggers a warning instead of an implied
-  "there are none."
+  within one response are suffixed so neither is lost. Each fetch stages to a
+  temp file and is promoted with `mv` only once it checks out, so a failed
+  re-download over an expired link leaves the copy already on disk untouched —
+  and reports `failed_files` naming what could not be refreshed.
+- **Only the most recent page of messages is read.** Every read path warns when
+  `has_more` is true, because an attachment on an older message is not visible
+  and the count reported is then a floor, not a total. Real pagination is #8.
 
 ## State
 

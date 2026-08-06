@@ -25,7 +25,9 @@ The `result` subcommand returns status + assistant text in one call (it fetches 
 "${CLAUDE_PLUGIN_ROOT:-$HOME/ML-AI/claude/manus-dispatch}/scripts/manus-client.sh" download "$ARGUMENTS"
 ```
 
-That writes each attachment under `~/.config/manus-dispatch/files/<task_id>/` and prints the local paths. Read them and synthesize from the file contents, not from the summary. Pass `--out DIR` when the user wants them somewhere specific.
+That writes each attachment under `~/.config/manus-dispatch/files/<task_id>/` and prints the local paths. Pass `--out DIR` when the user wants them somewhere specific.
+
+**Check the download before you read from it.** The output carries `ok`, `failed`, `failed_files`, and a `bytes` count per file. If `ok` is false, `failed` is above zero, or any file's `bytes` is 0, the deliverable is incomplete — say so and name what's in `failed_files`, and do **not** synthesize an answer from what did arrive. The usual cause is an expired signed URL; re-running `download` fetches fresh links. Only when `ok` is true and every file has bytes should you read them and synthesize from the file contents rather than the summary.
 
 ### Case 2: no task_id (poll all running tasks)
 
@@ -52,6 +54,6 @@ If no state files exist, tell the user there are no tracked tasks and suggest `/
 ## Notes
 
 - Polling is on-demand only. No background process.
-- Once a result is fetched it's written into the state file at `.result` — subsequent calls don't re-fetch the full message log.
-- If `obsidian_enabled = true` in config, completed results are also written to the Obsidian vault (see `file_to_obsidian` in `manus-client.sh`, wired into `cmd_result`). The note lists attachment filenames but does not embed their URLs — Manus signs them with an expiry, so re-run `download` instead of reusing an old link.
-- `files <task_id>` lists attachments without downloading them, if you just need names and types.
+- Each call re-fetches the message log; nothing is cached. The state file records the result, but only as a record — polling a task twice costs two API calls, and `download` re-fetches every attachment.
+- If `obsidian_enabled = true` in config and a vault resolves, completed results are also written to the Obsidian vault (see `file_to_obsidian` in `manus-client.sh`, wired into `cmd_result`). The note lists attachment filenames but does not embed their URLs — Manus signs them with an expiry, so re-run `download` instead of reusing an old link.
+- `files <task_id>` lists attachment names and types without downloading them. It withholds the signed URLs unless you pass `--with-urls`; each one is a month-long capability that needs no API key, so don't put them anywhere durable.
