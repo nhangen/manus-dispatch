@@ -27,10 +27,21 @@
 #      note stores a signed URL                 leaves a link that rots
 #   7. an unparseable body errors out          -> it must never degrade to
 #                                                "count: 0", which is the same
-#                                                silent omission as issue #6
+#                                                silent omission as the original bug
 #   8. a 403/404/mid-body-truncated download   -> a partial file counted as
-#      is counted as a failure                   delivered is issue #6 again
+#      is counted as a failure                   delivered is the original bug again
 #   9. re-running download overwrites          -> no -2/-3 pile-up per poll
+#      (a file count, so it does not catch stale content — check 10 does)
+#  10. each attachment carries its own bytes  -> a shared fixture body would let
+#                                                a wrong url pass unnoticed
+#  11. a failed re-download keeps the copy    -> the signed URL dies while the
+#      already on disk                          poll loop keeps running
+#  12. a 0-byte HTTP 200 is a failure         -> an empty file is not a payload
+#  13. a truncated page warns on every        -> a partial count reported as a
+#      read path                                total is the same omission
+#  14. the completion notice names the        -> the notice is the only place a
+#      attachments, and says so even when       user learns a file is waiting
+#      the count is unreadable
 #
 # Usage: tests/attachments-test.sh   (exit 0 = pass, non-zero = fail)
 
@@ -68,15 +79,29 @@ AUTH_LOG="$TMP/cdn-auth.log"
 #   PLAINTASK   -> text-only reply, no attachments
 #   TRUNCTASK   -> a truncated (HTTP 200) body that cannot be parsed
 #   BADCDNTASK  -> four attachments whose links 403 / 404 / truncate / succeed
+#   FLIPTASK    -> one link that succeeds once, then 403s
+#   EMPTYTASK   -> one link that answers 200 with zero bytes
+#   MORETASK    -> a well-formed page carrying has_more: true
 # /cdn/<name>      -> file bytes; logs whether an x-manus-api-key came with it
 # /cdn-403|404/    -> the matching status
 # /cdn-short/      -> promises 999 bytes, sends 7, closes (curl: 200 + exit 18)
+# /cdn-flip/       -> 200 the first time, 403 after
+# /cdn-empty/      -> 200 with Content-Length: 0
+# Every request path is appended to $AUTH_LOG.req so a test can assert on the
+# query string the client actually sent (e.g. its page limit).
 cat > "$TMP/server.py" <<'PY'
 import http.server, json, os, socketserver, sys, urllib.parse
 
 PORT_FILE = sys.argv[1]
 AUTH_LOG = sys.argv[2]
-BODY = b"| platform | reach |\n| --- | --- |\n| A | 1 |\n"
+
+# Path-dependent so a test can tell attachment i from attachment 0. With one
+# shared BODY, mutating .[0].url to point at another file keeps the suite green.
+def cdn_body(path):
+    return (b"| platform | reach |\n| --- | --- |\n| A | 1 |\n"
+            b"<!-- source: " + path.encode() + b" -->\n")
+
+FLIPPED = set()
 
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -91,6 +116,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_GET(self):
+        with open(AUTH_LOG + ".req", "a") as fh:
+            fh.write(self.path + "\n")
         path = urllib.parse.urlparse(self.path).path
         base = f"http://127.0.0.1:{self.server.server_address[1]}"
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -144,6 +171,59 @@ class H(http.server.BaseHTTPRequestHandler):
                 "has_more": False,
             })
             return
+        # One attachment served from a link that succeeds once and 403s after.
+        # Re-downloading it must leave the first copy intact.
+        if path == "/v2/task.listMessages" and task == "FLIPTASK":
+            self._json({
+                "ok": True,
+                "messages": [
+                    {"type": "status_update", "id": "s1",
+                     "status_update": {"agent_status": "stopped"}},
+                    {"type": "assistant_message", "id": "a1", "assistant_message": {
+                        "content": "Attached.",
+                        "attachments": [
+                            {"type": "file", "filename": "flip.md",
+                             "content_type": "text/markdown",
+                             "url": f"{base}/cdn-flip/flip"},
+                        ]}},
+                ],
+                "has_more": False,
+            })
+            return
+        # A 200 with a zero-length body: an empty file is not a deliverable.
+        if path == "/v2/task.listMessages" and task == "EMPTYTASK":
+            self._json({
+                "ok": True,
+                "messages": [
+                    {"type": "status_update", "id": "s1",
+                     "status_update": {"agent_status": "stopped"}},
+                    {"type": "assistant_message", "id": "a1", "assistant_message": {
+                        "content": "Attached.",
+                        "attachments": [
+                            {"type": "file", "filename": "hollow.md",
+                             "content_type": "text/markdown",
+                             "url": f"{base}/cdn-empty/hollow"},
+                        ]}},
+                ],
+                "has_more": False,
+            })
+            return
+        # A well-formed page that is only the newest slice of the log. Nothing
+        # here carries an attachment, so every read path must say so out loud
+        # rather than report a confident zero.
+        if path == "/v2/task.listMessages" and task == "MORETASK":
+            self._json({
+                "ok": True,
+                "messages": [
+                    {"type": "status_update", "id": "s1",
+                     "status_update": {"agent_status": "stopped"}},
+                    {"type": "assistant_message", "id": "a1",
+                     "assistant_message": {"content": "Partial log."}},
+                ],
+                "has_more": True,
+                "next_cursor": "cursor-abc",
+            })
+            return
         if path == "/v2/task.listMessages":
             self._json({
                 "ok": True,
@@ -173,6 +253,27 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_response(403)
             self.end_headers()
             return
+        # Succeeds the first time, 403s every time after — a signed URL aging
+        # out between two polls of the same task.
+        if path.startswith("/cdn-flip/"):
+            if path in FLIPPED:
+                self.send_response(403)
+                self.end_headers()
+                return
+            FLIPPED.add(path)
+            body = cdn_body(path)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.startswith("/cdn-empty/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path.startswith("/cdn-404/"):
             self.send_response(404)
             self.end_headers()
@@ -191,11 +292,12 @@ class H(http.server.BaseHTTPRequestHandler):
             with open(AUTH_LOG, "a") as fh:
                 fh.write(("KEY_SENT" if self.headers.get("x-manus-api-key")
                           else "NO_KEY") + "\n")
+            body = cdn_body(path)
             self.send_response(200)
             self.send_header("Content-Type", "text/markdown")
-            self.send_header("Content-Length", str(len(BODY)))
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(BODY)
+            self.wfile.write(body)
             return
         self.send_response(404)
         self.end_headers()
@@ -236,11 +338,17 @@ check "first filename surfaced" \
 check "content_type surfaced" \
   "$(printf '%s' "$FILES_OUT" | jq -r '.attachments[0].content_type')" \
   "text/markdown; charset=utf-8"
-check "url surfaced" \
-  "$(printf '%s' "$FILES_OUT" | jq -r '.attachments[0].url | startswith("http")')" "true"
+check "url withheld by default" \
+  "$(printf '%s' "$FILES_OUT" | jq -r '[.attachments[] | has("url")] | any')" "false"
+FILES_URL=$(bash "$CLIENT" files "$TASK" --with-urls 2>>"$TMP/files.err")
+check "url surfaced only when asked for" \
+  "$(printf '%s' "$FILES_URL" | jq -r '.attachments[0].url | startswith("http")')" "true"
 
 echo "== download =="
-OUT_DIR="$TMP/out"
+# Nested two levels under $TMP so that "../../" from OUT_DIR still lands inside
+# the sandbox. A traversal assertion that reaches $TMPDIR leaves an artifact the
+# EXIT trap never removes, and the next run of this suite reads it as a failure.
+OUT_DIR="$TMP/dl/lvl/out"
 DL_OUT=$(bash "$CLIENT" download "$TASK" --out "$OUT_DIR" 2>"$TMP/dl.err")
 check "download reports 3 files" "$(printf '%s' "$DL_OUT" | jq -r '.count')" "3"
 check "download ok" "$(printf '%s' "$DL_OUT" | jq -r '.ok')" "true"
@@ -253,7 +361,7 @@ check "downloaded bytes match served body" \
   "$(head -1 "$OUT_DIR/kinematic_specs.md" 2>/dev/null)" "| platform | reach |"
 
 # The traversal filename must be flattened into OUT_DIR, never written above it.
-if [ -e "$TMP/escaped.md" ] || [ -e "$TMP/out/../../escaped.md" ]; then
+if [ -e "$TMP/dl/escaped.md" ] || [ -e "$TMP/dl/lvl/escaped.md" ]; then
   echo "  FAIL: traversal filename escaped --out"; fails=$((fails + 1))
 else
   echo "  ok: traversal filename did not escape --out"
@@ -262,7 +370,7 @@ check "traversal filename flattened into out_dir" \
   "$(ls "$OUT_DIR" | grep -c 'escaped.md')" "1"
 
 # A duplicate basename must be suffixed, not overwritten — otherwise half the
-# deliverable is silently lost, the same class of bug as issue #6 itself.
+# deliverable is silently lost.
 check "duplicate basename suffixed, not overwritten" \
   "$(ls "$OUT_DIR" | grep -c '^kinematic_specs')" "2"
 check "both duplicate copies have bytes" \
@@ -337,7 +445,7 @@ check "daily note flags the attachment" \
 printf '' > "$HOME/.config/manus-dispatch/config.toml"
 
 echo "== an unreadable response is an error, NOT 'no attachments' =="
-# The whole point of issue #6 is a payload silently going missing. A body we
+# A payload silently going missing is the whole failure mode here. A body we
 # can't parse must never be reported as a task that simply has no files.
 TRUNC_OUT=$(bash "$CLIENT" files TRUNCTASK 2>"$TMP/trunc.err")
 trunc_rc=$?
@@ -371,8 +479,8 @@ check "download reports ok:false" "$(printf '%s' "$BAD_OUT" | jq -r '.ok')" "fal
 check "download counts 3 failures" "$(printf '%s' "$BAD_OUT" | jq -r '.failed')" "3"
 check "download still saves the one good file" \
   "$(printf '%s' "$BAD_OUT" | jq -r '.count')" "1"
-check "expired link explained as expiry" \
-  "$(grep -c 'signed URL has expired' "$TMP/bad.err" || true)" "1"
+check "expired link explained as a likely expiry" \
+  "$(grep -c 'link may have expired' "$TMP/bad.err" || true)" "1"
 # A 200 that dies mid-body must not leave a partial file counted as delivered.
 check "truncated transfer called out" \
   "$(grep -c 'transfer incomplete' "$TMP/bad.err" || true)" "1"
@@ -397,6 +505,128 @@ plain_rc=$?
 check "download exits 0 on a text-only task" "$plain_rc" "0"
 check "download reports 0 files, ok:true" \
   "$(printf '%s' "$PLAIN_DL" | jq -r '"\(.count) \(.ok)"')" "0 true"
+
+echo "== a failed re-download keeps the copy already on disk =="
+# The signed URL dies about a month out and manus-status re-runs download on
+# every poll, so this is the scheduled case, not a rare one: the second fetch
+# 403s over the only copy of a paid deliverable.
+FLIP_DIR="$TMP/flipout"
+bash "$CLIENT" download FLIPTASK --out "$FLIP_DIR" >/dev/null 2>&1
+check "first download saved the file" \
+  "$([ -s "$FLIP_DIR/flip.md" ] && echo yes || echo no)" "yes"
+FLIP_BYTES=$(wc -c < "$FLIP_DIR/flip.md" | tr -d ' ')
+FLIP2=$(bash "$CLIENT" download FLIPTASK --out "$FLIP_DIR" 2>"$TMP/flip2.err")
+check "re-download reports the failure" "$(printf '%s' "$FLIP2" | jq -r '.failed')" "1"
+check "the good copy survives a failed re-download" \
+  "$([ -s "$FLIP_DIR/flip.md" ] && echo yes || echo no)" "yes"
+check "the surviving copy is unchanged" \
+  "$(wc -c < "$FLIP_DIR/flip.md" | tr -d ' ')" "$FLIP_BYTES"
+
+echo "== an empty 200 is not a deliverable =="
+EMPTY_DIR="$TMP/emptyout"
+EMPTY_OUT=$(bash "$CLIENT" download EMPTYTASK --out "$EMPTY_DIR" 2>"$TMP/empty.err")
+check "empty body counted as a failure" "$(printf '%s' "$EMPTY_OUT" | jq -r '.failed')" "1"
+check "empty body not counted as saved" "$(printf '%s' "$EMPTY_OUT" | jq -r '.count')" "0"
+check "no zero-byte file left behind" \
+  "$(ls "$EMPTY_DIR" 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "empty body explained on stderr" \
+  "$(grep -c 'empty' "$TMP/empty.err" || true)" "1"
+
+echo "== each attachment gets its own bytes =="
+# Guards against a fixture where every CDN path serves the same body: with one
+# shared body, pointing .[0].url at another file keeps the suite green.
+check "suffixed duplicate carries the second url's bytes" \
+  "$(grep -c 'source: /cdn/specs-v2' "$OUT_DIR/kinematic_specs-2.md" || true)" "1"
+check "first copy carries the first url's bytes" \
+  "$(grep -c 'source: /cdn/specs' "$OUT_DIR/kinematic_specs.md" || true)" "1"
+
+echo "== a truncated page is not a confident zero on any read path =="
+: > "$AUTH_LOG.req"
+MORE_ST=$(bash "$CLIENT" status MORETASK 2>"$TMP/more-st.err")
+check "status reports 0 attachments on a partial log" \
+  "$(printf '%s' "$MORE_ST" | jq -r '.attachment_count')" "0"
+check "status warns that the log was truncated" \
+  "$(grep -c 'longer than one page' "$TMP/more-st.err" || true)" "1"
+check "status reads a full page, not a short one" \
+  "$(grep -c 'limit=50' "$AUTH_LOG.req" || true)" "1"
+jq -nc '{task_id:"MORETASK", title:"Partial", query:"q",
+  task_url:"https://manus.ai/app/x", started_at:"2026-08-05T00:00:00Z", status:"running"}' \
+  > "$HOME/.config/manus-dispatch/state/MORETASK.json"
+bash "$CLIENT" result MORETASK >/dev/null 2>"$TMP/more-res.err"
+check "result warns that the log was truncated" \
+  "$(grep -c 'longer than one page' "$TMP/more-res.err" || true)" "1"
+
+echo "== status does not blank a known attachment list on a truncated read =="
+jq -nc --arg id "$TASK" '{task_id:$id, title:"Kinematic specs", query:"q",
+  task_url:"https://manus.ai/app/x", started_at:"2026-08-05T00:00:00Z", status:"running",
+  attachments:[{filename:"kinematic_specs.md", content_type:"text/markdown"}]}' \
+  > "$HOME/.config/manus-dispatch/state/$TASK.json"
+bash "$CLIENT" status MORETASK >/dev/null 2>&1
+check "an unrelated task's recorded attachments are untouched" \
+  "$(jq -r '.attachments | length' "$HOME/.config/manus-dispatch/state/$TASK.json")" "1"
+jq -nc '{task_id:"MORETASK", title:"Partial", query:"q",
+  task_url:"https://manus.ai/app/x", started_at:"2026-08-05T00:00:00Z", status:"running",
+  attachments:[{filename:"seen-earlier.md", content_type:"text/markdown"}]}' \
+  > "$HOME/.config/manus-dispatch/state/MORETASK.json"
+bash "$CLIENT" status MORETASK >/dev/null 2>&1
+check "a truncated read does not erase attachments already recorded" \
+  "$(jq -r '.attachments | length' "$HOME/.config/manus-dispatch/state/MORETASK.json")" "1"
+
+echo "== the completion notice names the attachments =="
+# The 📎 line is the only place a
+# user learns a file is waiting. Drive the hook against a stub client so the
+# notice text itself is asserted, not just the client JSON behind it.
+HOOK="$(cd "$(dirname "$CLIENT")/../hooks" && pwd)/notify-completed.sh"
+if [ ! -f "$HOOK" ]; then
+  echo "  FAIL: hook not found at $HOOK"; fails=$((fails + 1))
+else
+  hook_notice() { # hook_notice <attachment_count-json-fragment>
+    local stub_dir="$TMP/hookstub" hs="$TMP/hookstate"
+    rm -rf "$stub_dir" "$hs"; mkdir -p "$stub_dir" "$hs"
+    cat > "$stub_dir/manus-client.sh" <<STUB
+#!/bin/bash
+printf '%s\n' '{"ok":true,"task_id":"HOOKTASK","status":"stopped",$1}'
+STUB
+    chmod +x "$stub_dir/manus-client.sh"
+    jq -nc '{task_id:"HOOKTASK", title:"Hook fixture", query:"q",
+      task_url:"https://manus.ai/app/x", started_at:"2026-08-05T00:00:00Z", status:"running"}' \
+      > "$hs/HOOKTASK.json"
+    MANUS_STATE_DIR="$hs" MANUS_CLIENT="$stub_dir/manus-client.sh" \
+      bash "$HOOK" 2>/dev/null
+  }
+  NOTICE=$(hook_notice '"attachment_count":2')
+  check "notice announces the file count" \
+    "$(printf '%s' "$NOTICE" | grep -c '📎 2 file(s)' || true)" "1"
+  check "notice names the download command" \
+    "$(printf '%s' "$NOTICE" | grep -c 'download HOOKTASK' || true)" "1"
+  NOTICE0=$(hook_notice '"attachment_count":0')
+  check "no notice when there are no files" \
+    "$(printf '%s' "$NOTICE0" | grep -c '📎' || true)" "0"
+  # A non-numeric count is a contract break, not "no files": saying nothing here
+  # reproduces exactly the issue-#6 experience the notice exists to prevent.
+  NOTICEBAD=$(hook_notice '"attachment_count":"two"')
+  check "a non-numeric count is called out as unreadable" \
+    "$(printf '%s' "$NOTICEBAD" | grep -c "unreadable count" || true)" "1"
+  check "a non-numeric count is not printed as a file count" \
+    "$(printf '%s' "$NOTICEBAD" | grep -c 'two file(s)' || true)" "0"
+  # `result` now exits non-zero when it cannot parse the body. The hook must not
+  # treat that as "nothing to report" and silently re-poll forever.
+  FAILSTUB="$TMP/failstub"; rm -rf "$FAILSTUB"; mkdir -p "$FAILSTUB" "$TMP/failstate"
+  printf '#!/bin/bash\necho "manus-client: could not parse attachments" >&2\nexit 1\n' \
+    > "$FAILSTUB/manus-client.sh"
+  chmod +x "$FAILSTUB/manus-client.sh"
+  jq -nc '{task_id:"FAILTASK", title:"Unparseable", query:"q",
+    task_url:"https://manus.ai/app/x", started_at:"2026-08-05T00:00:00Z", status:"running"}' \
+    > "$TMP/failstate/FAILTASK.json"
+  FAIL_ERR=$(MANUS_STATE_DIR="$TMP/failstate" MANUS_CLIENT="$FAILSTUB/manus-client.sh" \
+    bash "$HOOK" 2>&1 >/dev/null)
+  # The client's own stderr has to reach the user, not just the hook's summary
+  # line: without it there is nothing anywhere saying *why* the task re-polls.
+  check "the client's own diagnostic is forwarded, not discarded" \
+    "$(printf '%s' "$FAIL_ERR" | grep -c 'could not parse attachments' || true)" "1"
+  check "the failing task is named" \
+    "$(printf '%s' "$FAIL_ERR" | grep -c 'FAILTASK' || true)" "1"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then
