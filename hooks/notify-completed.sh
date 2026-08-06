@@ -30,8 +30,10 @@ fi
 
 : "${HOME:?HOME must be set}"
 
-STATE_DIR="$HOME/.config/manus-dispatch/state"
-CLIENT="${CLAUDE_PLUGIN_ROOT:-$HOME/ML-AI/claude/manus-dispatch}/scripts/manus-client.sh"
+# Both overridable so tests can drive the hook against a stub client and a
+# throwaway state dir instead of the real ones.
+STATE_DIR="${MANUS_STATE_DIR:-$HOME/.config/manus-dispatch/state}"
+CLIENT="${MANUS_CLIENT:-${CLAUDE_PLUGIN_ROOT:-$HOME/ML-AI/claude/manus-dispatch}/scripts/manus-client.sh}"
 
 # Bail quietly if not set up
 [ -d "$STATE_DIR" ] || exit 0
@@ -69,7 +71,19 @@ for f in "${candidates[@]}"; do
   # those tasks down the `running` arm and re-poll them forever — the exact
   # loop this hook is meant to avoid. Ignore fetch failures (bad key, network,
   # rate limit): notified_at stays unset, so the task is retried next fire.
-  resp=$("$CLIENT" result "$task_id" 2>/dev/null) || continue
+  #
+  # The client's stderr is kept and echoed on failure. Discarding it turned a
+  # permanent failure — an API shape change, which makes `result` exit non-zero
+  # every time — into an invisible re-poll on every SessionStart and Stop, in
+  # every project, with nothing anywhere saying why.
+  client_err=$(mktemp -t manus-notify.XXXXXX)
+  if ! resp=$("$CLIENT" result "$task_id" 2>"$client_err"); then
+    echo "notify-completed: 'result $task_id' failed; will retry next fire" >&2
+    [ -s "$client_err" ] && sed 's/^/notify-completed:   /' "$client_err" >&2
+    rm -f "$client_err"
+    continue
+  fi
+  rm -f "$client_err"
   status=$(printf '%s' "$resp" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
   title=$(jq -r '.title // .query // "untitled"' "$f")
 
@@ -100,11 +114,25 @@ for f in "${candidates[@]}"; do
       continue
       ;;
     stopped)
+      # An attached-file deliverable is easy to miss — the summary text reads as
+      # complete while the payload sits behind `download`. Say so.
+      att=$(printf '%s' "$resp" | jq -r '.attachment_count // 0' 2>/dev/null || echo 0)
+      att_note=""
+      case "$att" in
+        ''|0) ;;
+        *[!0-9]*)
+          # Not a number means the client's contract changed. Staying silent
+          # here is the very outcome this notice exists to prevent, so say
+          # something a user can act on.
+          att_note=" — 📎 attachments may be present (unreadable count '${att}'), check: manus-client.sh files ${task_id}"
+          ;;
+        *) att_note=" — 📎 ${att} file(s), fetch: manus-client.sh download ${task_id}" ;;
+      esac
       note=$(jq -r '.obsidian_note // ""' "$f")
       if [ -n "$note" ] && [ "$note" != "null" ]; then
-        completed_lines+=("• ${title} → ${note}")
+        completed_lines+=("• ${title} → ${note}${att_note}")
       else
-        completed_lines+=("• ${title} (task ${task_id})")
+        completed_lines+=("• ${title} (task ${task_id})${att_note}")
       fi
       ;;
     *)

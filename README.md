@@ -13,7 +13,10 @@ research; Claude orchestrates and synthesizes the result back into your session.
 - `/manus-dispatch:cancel <task_id>` — best-effort stop.
 
 The plugin also ships `scripts/manus-client.sh`, which you can call directly
-outside Claude Code: `manus-client.sh create|status|result|cancel`.
+outside Claude Code: `manus-client.sh create|status|result|files|download|cancel`.
+When a task's deliverable is an attached file rather than inline text, `files`
+lists the attachments and `download` fetches them — see
+[File deliverables](#file-deliverables).
 
 ## Auto-notify on completed tasks
 
@@ -103,7 +106,11 @@ When `cmd_result` fetches a completed task:
      <first-200-chars of result, headings/code stripped>
    ```
 
-   Entries are deduped by the `<!-- manus:<id> -->` marker.
+   Entries are deduped by the `<!-- manus:<id> -->` marker. When the task has
+   attachments, the daily-note line ends with `📎 <n> file(s): <names>` and the
+   research note gains an `## Attachments` section listing the filenames plus
+   the `download` command to fetch them. Filenames only — the signed URLs
+   expire, so a link pasted into the vault would rot.
 
 ### On failure
 
@@ -140,12 +147,67 @@ Targets the Manus v2 API:
 |---|---|---|
 | `create` | `POST /v2/task.create` | `{"message":{"content":[{"type":"text","text":"..."}]}}` |
 | `status` | `GET /v2/task.listMessages` | parses `agent_status` from latest `status_update` event |
-| `result` | `GET /v2/task.listMessages` | same, plus extracts most recent `assistant_message.content` |
+| `result` | `GET /v2/task.listMessages` | same, plus the most recent `assistant_message.content` and the `attachments[]` of every assistant message in the page |
+| `files` | `GET /v2/task.listMessages` | lists `assistant_message.attachments[]` (filename + content type; signed URL only with `--with-urls`) |
+| `download` | `GET /v2/task.listMessages` + CDN GET | fetches each attachment to `--out DIR` (default `~/.config/manus-dispatch/files/<task_id>`) |
 | `cancel` | `POST /v2/task.stop` | marks state file `cancelled_at` |
 
 `agent_status` ∈ `{running, stopped, waiting, error}`. `stopped` is terminal
 for both successful completion and user cancellation — the state file's
 `cancelled_at` field distinguishes them.
+
+### File deliverables
+
+Manus often returns the real payload — a table, CSV, report, generated code —
+as an **attachment** rather than inline text, with the assistant message
+reduced to "the full table is attached." Those attachments arrive on
+`assistant_message.attachments[]` in the same `listMessages` response, each
+with a pre-signed `manuscdn.com` URL:
+
+```json
+{ "type": "file", "filename": "kinematic_specs.md",
+  "content_type": "text/markdown; charset=utf-8",
+  "url": "https://private-us-east-1.manuscdn.com/sessionFile/...?Policy=...&Signature=..." }
+```
+
+Two consequences worth knowing:
+
+- **The URL takes no API key** — it carries its own CloudFront signature, and
+  `download` deliberately omits the `x-manus-api-key` header so the key never
+  reaches a third-party host. (Sending the key is what makes hand-rolled
+  `curl` attempts against guessed API paths return 401 — there is no
+  attachment endpoint to authenticate against.)
+- **The URL expires.** The `Policy` value carries the window; nothing here
+  parses it, so treat any link older than a few weeks as suspect. Nothing
+  caches it either: the state file and the Obsidian note record filenames only,
+  and every call re-fetches a fresh link. A refused link surfaces as `HTTP 403`
+  with a re-run instruction, not a generic failure. `files` withholds the URL
+  entirely unless `--with-urls` is passed — it is a bearer capability, and this
+  output ends up in Claude's context and from there in session notes.
+
+`result`, `status`, and the auto-notify hook all report `attachment_count` so a
+file deliverable can't look complete while the payload is missing. Because that
+silent omission is the whole bug, the retrieval path refuses to guess:
+
+- **An unparseable response is an error, not "no attachments."** If the JSON
+  can't be read, `status`/`result`/`files`/`download` exit non-zero with a
+  diagnostic rather than reporting `count: 0`.
+- **An attachment with no usable URL is counted and reported.** If the API
+  renames the field, the extraction would otherwise succeed and return an empty
+  list — the original bug under a new cause — so a drop is warned about loudly.
+- **A transfer that dies mid-body is a failure even at HTTP 200.** `curl`'s exit
+  status is checked alongside the status code; a partial file is discarded, not
+  counted. `download` exits non-zero if any attachment failed, and reports
+  `failed: <n>` while still saving the ones that succeeded.
+- **`download` overwrites its own previous output** rather than accumulating
+  `-2`, `-3` copies per poll. Two attachments that genuinely share a filename
+  within one response are suffixed so neither is lost. Each fetch stages to a
+  temp file and is promoted with `mv` only once it checks out, so a failed
+  re-download over an expired link leaves the copy already on disk untouched —
+  and reports `failed_files` naming what could not be refreshed.
+- **Only the most recent page of messages is read.** Every read path warns when
+  `has_more` is true, because an attachment on an older message is not visible
+  and the count reported is then a floor, not a total. Real pagination is #8.
 
 ## State
 
@@ -159,13 +221,22 @@ across sessions. Polling is on-demand only — no background processes.
   trap-cleanup) — never on the command line or in process args.
 - `curl` stderr is scrubbed to drop any `x-manus-api-key` / `Authorization`
   lines before surfacing.
+- Attachment downloads run **without** the auth header — the CDN URL is
+  pre-signed, so sending the key would hand it to a host that doesn't need it.
+- API-supplied filenames are flattened to a safe basename before writing, so a
+  crafted `../../` filename can't escape the `--out` directory.
 - `rate_limited` errors back off exponentially (1s, 2s, 4s; max 3 attempts).
 
 ## Status
 
-v0.1.5 — CLI client, three slash commands, optional Obsidian filing, config
-validation, and SessionStart+Stop auto-notify hooks are all functional and
-smoke-tested against the live Manus v2 API.
+v0.1.6 — CLI client, three slash commands, attachment retrieval
+(`files`/`download`), optional Obsidian filing, config validation, and
+SessionStart+Stop auto-notify hooks are all functional and smoke-tested against
+the live Manus v2 API.
+
+Tests: `tests/notify-completed-test.sh` (hook classification),
+`tests/attachments-test.sh` (attachment listing/download against a local stub
+of both the API and the CDN).
 
 Not yet implemented:
 - PreToolUse hook for hard cost-gating (currently soft via slash-command
